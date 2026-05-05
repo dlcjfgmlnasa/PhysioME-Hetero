@@ -1,0 +1,65 @@
+/* changes to global variables */
+body {
+    --p-spacing: 1.0rem;
+    --p-spacing-empty: 1.0rem;
+    --heading-spacing: 0;
+    --list-edit-offset: 0;
+}
+
+/* -------------------------- */
+/* edit mode (preview) tweaks */
+/* -------------------------- */
+
+/* Spacing before all headings */
+.cm-s-obsidian .cm-line.HyperMD-header {
+    padding-top: var(--p-spacing-empty);
+    padding-bottom: 0 !important;
+}
+
+/* Larger spacing before H1 */
+.cm-line.HyperMD-header-1 {
+    padding-top: calc(var(--p-spacing-empty)*2) !important;
+}
+
+/* Margin between H1 and its divider */
+.h1-l .markdown-reading-view h1:not(.embedded-note-title), 
+.h1-l .mod-cm6 .cm-editor .HyperMD-header-1{
+    padding-bottom: calc(var(--p-spacing-empty)*0.8) !important;
+    border-bottom: 2.5px solid var(--h1l); /* thicker divider */
+}
+
+/* Spacing before First lines of lists */
+.is-live-preview .cm-line:not(.HyperMD-list-line) + 
+.cm-line.HyperMD-list-line {
+    padding-top: var(--p-spacing-empty);
+}
+
+/* Larger list indent */
+.cm-formatting-list.cm-formatting-list-ul {
+    margin-right: 5px;
+}
+
+/* ---------------- */
+/* read mode tweaks */
+/* ---------------- */
+
+/* Spacing of headings except for H1 */
+.markdown-rendered :is(h2, h3, h4, h5, h6) {
+    margin-block-start: var(--p-spacing-empty) !important;
+    margin-block-end: 0.0rem !important;
+    padding-top: 0rem !important;
+    padding-bottom: 0.0rem !important;
+}
+
+/* Spacing of H1 */
+.markdown-rendered :is(h1) {
+    margin-block-start: calc(var(--p-spacing-empty)*2) !important;
+    margin-block-end: 0.0rem !important;
+    padding-top: 0rem !important;
+    padding-bottom: calc(var(--p-spacing-empty)/2) !important; /* spacing above divider */
+}
+
+/* Larger list indent */
+.markdown-rendered .list-bullet {
+    margin-right: 5px;
+}

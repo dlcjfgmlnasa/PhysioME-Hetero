@@ -1,0 +1,29 @@
+{
+  "pluginList": [
+    "sdkasper/lean-obsidian-terminal",
+    "YishenTu/claudian"
+  ],
+  "pluginSubListFrozenVersion": [
+    {
+      "repo": "sdkasper/lean-obsidian-terminal",
+      "version": ""
+    },
+    {
+      "repo": "YishenTu/claudian",
+      "version": ""
+    }
+  ],
+  "themesList": [],
+  "updateAtStartup": true,
+  "updateThemesAtStartup": true,
+  "enableAfterInstall": true,
+  "loggingEnabled": false,
+  "loggingPath": "BRAT-log",
+  "loggingVerboseEnabled": false,
+  "debuggingMode": false,
+  "notificationsEnabled": true,
+  "globalTokenName": "",
+  "personalAccessToken": "",
+  "selectLatestPluginVersionByDefault": false,
+  "allowIncompatiblePlugins": false
+}
