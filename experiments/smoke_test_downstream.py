@@ -63,13 +63,17 @@ def main() -> None:
     classifier = PhysioMEClassifier(physio_me=physio_me, n_classes=n_classes).to(device)
     classifier.eval()  # PhysioME is frozen; fc still gets grads
 
-    # Enumerate 7 non-empty subsets.
+    # Enumerate every non-empty modal subset (2^N - 1 total).
+    n_modals = len(MODAL_ORDER)
     all_subsets = []
-    for r in (1, 2, 3):
+    for r in range(1, n_modals + 1):
         for combo in combinations(MODAL_ORDER, r):
             all_subsets.append(list(combo))
 
-    assert len(all_subsets) == 7, f'expected 7 subsets, got {len(all_subsets)}'
+    expected_n = (1 << n_modals) - 1
+    assert len(all_subsets) == expected_n, (
+        f'expected {expected_n} subsets for N={n_modals}, got {len(all_subsets)}'
+    )
 
     optim = torch.optim.AdamW(classifier.fc.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
@@ -115,7 +119,8 @@ def main() -> None:
     )
 
     print()
-    print(f'[smoke] PASSED -- 7 modal subsets, fc grads flow, backbone frozen')
+    print(f'[smoke] PASSED -- {len(all_subsets)} modal subsets ({n_modals} modal), '
+          'fc grads flow, backbone frozen')
 
 
 if __name__ == '__main__':

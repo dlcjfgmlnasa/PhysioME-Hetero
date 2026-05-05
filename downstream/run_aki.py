@@ -40,7 +40,7 @@ from downstream.tasks.hypotension import load_cases
 from downstream.utils import load_pretrained_to_classifier
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-MODAL_ORDER = ('ABP', 'ECG', 'PPG')
+MODAL_ORDER = ('ABP', 'ECG', 'PPG', 'CO2')
 
 
 def get_args():

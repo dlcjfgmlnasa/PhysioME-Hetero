@@ -209,10 +209,11 @@ class HypotensionDataset(Dataset):
     """Wrap a list of :class:`ForecastSample` for PyTorch DataLoader use.
 
     Yields ``(data_dict, label)`` where ``data_dict`` keys are uppercase
-    modality names ('ABP', 'ECG', 'PPG') matching ``PhysioME.modal_names``.
+    modality names ('ABP', 'ECG', 'PPG', 'CO2') matching ``PhysioME.modal_names``.
     """
 
-    def __init__(self, samples: List[ForecastSample], modal_order: Sequence[str] = ('ABP', 'ECG', 'PPG')):
+    def __init__(self, samples: List[ForecastSample],
+                 modal_order: Sequence[str] = ('ABP', 'ECG', 'PPG', 'CO2')):
         self.samples = samples
         self.modal_order = list(modal_order)
 

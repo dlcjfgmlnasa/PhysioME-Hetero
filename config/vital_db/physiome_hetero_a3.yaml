@@ -12,6 +12,7 @@ modality_name2path:
   'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
   'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
   'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
+  'CO2': '../../ckpt/vitaldb/neuronet/CO2/neuronet/model/best_model.pth'
 
 sfreq: 100
 rfreq: 100
@@ -56,6 +57,9 @@ lora_dropout: 0.05
 
 # A3 ablation toggle: enable restoration on incomplete (partial-real) batches.
 restoration_only_on_complete: false
+
+# Probe efficiency knob — see physiome_hetero.yaml.
+probe_max_subsets: 10
 
 print_point: 20
 ckpt_path: '../../ckpt/vital_db_hetero_a3/'

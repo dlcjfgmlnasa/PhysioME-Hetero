@@ -214,3 +214,6 @@ img.png
 
 # Obsidian wiki — local research notes, not shipped to public repo.
 obsidian_physiome_hetero/
+
+# Local git bundle artifacts (transfer files for air-gapped envs).
+*.bundle

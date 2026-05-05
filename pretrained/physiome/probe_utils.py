@@ -95,7 +95,10 @@ def run_probe(modal_subsets: Iterable[ModalSubset],
         train_x, train_y = train_latent_fn(subset)
         test_x, test_y = eval_latent_fn(subset)
 
-        clf = LogisticRegression(max_iter=max_iter, C=C, n_jobs=-1)
+        # n_jobs intentionally omitted: deprecated in sklearn >=1.8 and a
+        # no-op even when supplied (LogisticRegression with default lbfgs
+        # solver does not parallelize across cores).
+        clf = LogisticRegression(max_iter=max_iter, C=C)
         clf.fit(train_x, train_y)
         pred_y = clf.predict(test_x)
 

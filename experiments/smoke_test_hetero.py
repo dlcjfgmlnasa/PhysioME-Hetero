@@ -64,10 +64,23 @@ class ToyBackbone(nn.Module):
 def synthesise_dataset(tmp_dir: str, num_cases: int, sfreq: int, duration: int,
                        rng: np.random.Generator) -> None:
     expected = sfreq * duration
-    bucket_choices = ['111', '110', '101', '011', '100', '010', '001']
+    n_modals = len(MODAL_ORDER)
+    # Every non-empty subset bitmap of length n_modals (e.g. for 4 modal:
+    # 1111, 1110, 1101, ..., 0001 — 15 patterns).
+    bucket_choices = [
+        ''.join('1' if (i >> (n_modals - 1 - k)) & 1 else '0'
+                for k in range(n_modals))
+        for i in range(1, 1 << n_modals)
+    ]
+    full_bm = '1' * n_modals  # complete bucket — ensures miss_recon fires
     for ci in range(num_cases):
-        # Pick a random subject-level availability bitmap.
-        subject_bm = rng.choice(bucket_choices)
+        # Pick a random subject-level availability bitmap. First few cases
+        # are forced to the complete bucket so the synth-drop restoration
+        # loss is exercised even on small smoke-test dataset sizes.
+        if ci < max(2, num_cases // 8):
+            subject_bm = full_bm
+        else:
+            subject_bm = rng.choice(bucket_choices)
         subject_modality_set = np.array([c == '1' for c in subject_bm], dtype=bool)
 
         n_seg = int(rng.integers(20, 40))
@@ -111,7 +124,7 @@ def main() -> None:
     embed_dim = 64
 
     with tempfile.TemporaryDirectory() as tmp:
-        synthesise_dataset(tmp, num_cases=24, sfreq=sfreq, duration=duration, rng=rng)
+        synthesise_dataset(tmp, num_cases=32, sfreq=sfreq, duration=duration, rng=rng)
         paths = find_ssl_npz_paths(tmp)
         ds = HeteroVitalDBDataset(paths, eager=True, normalize=True)
         sampler = BucketBatchSampler(
@@ -140,7 +153,7 @@ def main() -> None:
         miss_zero_seen = False
         max_presence_grad = 0.0
         max_drop_token_grad = 0.0
-        max_steps = 40
+        max_steps = 60
         n_steps = 0
 
         for batch in loader:

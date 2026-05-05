@@ -5,6 +5,9 @@ ch_names:
   - 'ABP'
   - 'ECG'
   - 'PPG'
+  - 'CO2'
+# which channel index (0=ABP, 1=ECG, 2=PPG, 3=CO2) this run trains —
+# override on the command line per modality.
 ch_idx: 2
 sfreq: 100
 rfreq: 100

@@ -225,7 +225,7 @@ def extract_aki_samples(
 
 class AKIDataset(Dataset):
     def __init__(self, samples: List[AKISample],
-                 modal_order: Sequence[str] = ('ABP', 'ECG', 'PPG')):
+                 modal_order: Sequence[str] = ('ABP', 'ECG', 'PPG', 'CO2')):
         self.samples = samples
         self.modal_order = list(modal_order)
 

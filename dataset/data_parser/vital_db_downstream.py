@@ -10,12 +10,14 @@ Output (per case, one ``.npz`` in ``trg_path``):
     abp: float32 [N]   — preprocessed ABP at sfreq Hz, NaN where invalid
     ecg: float32 [N]   — preprocessed ECG, ditto
     ppg: float32 [N]   — preprocessed PPG, ditto
-    modality_present: bool [3]   — which of [ABP, ECG, PPG] exist in the recording
+    co2: float32 [N]   — preprocessed CO2 (capnography / etCO2), ditto
+    modality_present: bool [M]   — which of MODAL_ORDER exist in the recording
     sfreq: int
     case_id: str
 
 Modalities not recorded in the source case are not present in the npz at all
-(use ``modality_present`` to check before indexing).
+(use ``modality_present`` to check before indexing). Modality keys / order are
+shared with ``vital_db_ssl.py`` via ``MODAL_ORDER`` / ``MODAL_TO_SIGNAL_KEY``.
 """
 from __future__ import annotations
 

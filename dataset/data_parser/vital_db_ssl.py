@@ -16,10 +16,10 @@ Differences vs ``dataset/data_parser/vital_db.py``:
        (c) physiology-aware domain check (HR + autocorr regularity etc.).
 
 Output (per case, one ``.npz``):
-    x: float32 [T, 3, sfreq * duration], zero where ``mask[t, m] == False``.
-    mask: bool [T, 3] — per-segment, per-modality validity.
-    modal_names: object [3] — fixed order ``['ABP', 'ECG', 'PPG']``.
-    subject_modality_set: bool [3] — modalities present anywhere in the recording.
+    x: float32 [T, M, sfreq * duration], zero where ``mask[t, m] == False``.
+    mask: bool [T, M] — per-segment, per-modality validity.
+    modal_names: object [M] — fixed order from ``MODAL_ORDER``.
+    subject_modality_set: bool [M] — modalities present anywhere in the recording.
     case_id: str
 """
 from __future__ import annotations
@@ -44,12 +44,15 @@ MODAL_TRACK_NAMES: Dict[str, str] = {
     'ABP': 'SNUADC/ART',
     'ECG': 'SNUADC/ECG_II',
     'PPG': 'SNUADC/PLETH',
+    # Step 2 (2026-05-05): 4-modal expansion — CO2 (capnography / etCO2)
+    'CO2': 'Primus/CO2',
 }
 # short-name → key used by SIGNAL_CONFIGS / domain_quality_check
 MODAL_TO_SIGNAL_KEY: Dict[str, str] = {
     'ABP': 'abp', 'ECG': 'ecg', 'PPG': 'ppg',
+    'CO2': 'co2',
 }
-MODAL_ORDER = ['ABP', 'ECG', 'PPG']
+MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CO2']
 
 
 def get_args():

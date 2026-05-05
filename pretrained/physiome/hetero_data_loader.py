@@ -31,7 +31,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 
-MODAL_ORDER: List[str] = ['ABP', 'ECG', 'PPG']
+MODAL_ORDER: List[str] = ['ABP', 'ECG', 'PPG', 'CO2']
 NUM_MODALS: int = len(MODAL_ORDER)
 
 PRESENCE_REAL: int = 0
