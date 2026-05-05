@@ -9,7 +9,10 @@ from torch.utils.data import Dataset
 import warnings
 
 
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
+_visible_deprecation = getattr(np, 'VisibleDeprecationWarning', None) \
+    or getattr(getattr(np, 'exceptions', None), 'VisibleDeprecationWarning', None) \
+    or DeprecationWarning
+warnings.filterwarnings("ignore", category=_visible_deprecation)
 
 random_seed = 777
 np.random.seed(random_seed)
@@ -30,7 +33,7 @@ class TorchDataset(Dataset):
 
     @staticmethod
     def get_data(paths, ch_names, sfreq, rfreq, scaler_flag, downsampling):
-        info = mne.create_info(sfreq=sfreq, ch_types='eeg', ch_names=ch_names)
+        info = mne.create_info(sfreq=sfreq, ch_types='misc', ch_names=ch_names)
         scaler = mne.decoding.Scaler(info=info, scalings='median')
 
         total_x, total_y = [], []

@@ -13,7 +13,7 @@ import argparse
 import numpy as np
 from itertools import combinations
 import torch.optim as opt
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, f1_score
 from collections import OrderedDict
 from models.utils import model_size
@@ -23,7 +23,7 @@ from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
 from models.physiome.model import PhysioME
 from pretrained.physiome.data_loader import TorchDataset
 from torch.utils.data import DataLoader
-from peft import get_peft_model, LoraConfig
+from models.transformer import apply_lora
 
 
 warnings.filterwarnings(action='ignore')
@@ -42,7 +42,7 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_yaml', type=str,
-                        default=os.path.join('..', '..', 'config', 'sleep_edfx', 'physiome.yaml'))
+                        default=os.path.join('..', '..', 'config', 'vital_db', 'physiome.yaml'))
     return parser.parse_args()
 
 
@@ -210,65 +210,36 @@ class Trainer(object):
         return train_paths, val_paths, eval_paths
 
     def load_pretrained_unimodal(self, ckpt_path):
-        def get_find_parameter(model_state, find_name):
-            param_dict = OrderedDict()
-            for name, param in model_state.items():
-                if name.find(find_name) != -1:
-                    param_dict[name] = param
-            return param_dict
-
-        def change_parameter(pretrained_model_state, encoder_model, find_name):
-            old_param = get_find_parameter(model_state=pretrained_model_state, find_name=find_name)
-            new_param = encoder_model.state_dict()
-            new_param = {on: nv for on, nv in zip(new_param.keys(), old_param.values())}
-            return new_param
-
-        # 1. pretrained model
+        # 1. pretrained NeuroNet (Phase-1 unimodal MAE)
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model_parameter = ckpt['model_parameter']
         pretrained_model = NeuroNet(**model_parameter)
         pretrained_model.load_state_dict(ckpt['model_state'])
 
-        # 2. NeuroNetEncoder
+        # 2. NeuroNetEncoder — direct submodule transfer (no name-substring magic).
         backbone = NeuroNetEncoder(
             fs=model_parameter['fs'], second=model_parameter['second'],
             time_window=model_parameter['time_window'], time_step=model_parameter['time_step'],
             encoder_embed_dim=model_parameter['encoder_embed_dim'],
             encoder_heads=model_parameter['encoder_heads'],
-            encoder_depths=model_parameter['encoder_depths']
+            encoder_depths=model_parameter['encoder_depths'],
         )
-        backbone.frame_backbone.load_state_dict(change_parameter(
-            pretrained_model_state=pretrained_model.state_dict(),
-            encoder_model=backbone.frame_backbone,
-            find_name='frame_backbone',
-        ))
-        backbone.patch_embed.load_state_dict(change_parameter(
-            pretrained_model_state=pretrained_model.state_dict(),
-            encoder_model=backbone.patch_embed,
-            find_name='patch_embed',
-        ))
-        backbone.encoder_block.load_state_dict(change_parameter(
-            pretrained_model_state=pretrained_model.state_dict(),
-            encoder_model=backbone.encoder_block,
-            find_name='encoder_block',
-        ))
-        backbone.encoder_norm.load_state_dict(change_parameter(
-            pretrained_model_state=pretrained_model.state_dict(),
-            encoder_model=backbone.encoder_norm,
-            find_name='encoder_norm',
-        ))
+        backbone.frame_backbone.load_state_dict(pretrained_model.frame_backbone.state_dict())
+        backbone.patch_embed.load_state_dict(pretrained_model.autoencoder.patch_embed.state_dict())
+        backbone.encoder.load_state_dict(pretrained_model.autoencoder.encoder.state_dict())
         backbone.cls_token = pretrained_model.autoencoder.cls_token
-        backbone.pos_embed = pretrained_model.autoencoder.pos_embed
 
-        # 3. Apply LoRA (Low-Rank Adaptation of Large Language Models)
-        #  > https://arxiv.org/abs/2106.09685
-        #  > https://huggingface.co/docs/peft/main/en/conceptual_guides/lora
-        peft_config = LoraConfig(
-            r=self.args.lora_r, lora_alpha=self.args.lora_alpha, lora_dropout=self.args.lora_dropout, bias='none',
-            use_rslora=True, init_lora_weights='gaussian',
-            target_modules=['attn.proj'],
+        # 3. Hand-rolled LoRA on the GQA output projection (Hu et al. 2021 + rsLoRA).
+        # See ``models/transformer/lora.py`` for the rationale (drops the peft dep
+        # and the messy ``base_model.model...`` state-dict prefix).
+        backbone = apply_lora(
+            backbone,
+            target_attrs=('out_proj',),
+            r=self.args.lora_r,
+            alpha=self.args.lora_alpha,
+            dropout=self.args.lora_dropout,
+            rslora=True,
         )
-        backbone = get_peft_model(model=backbone, peft_config=peft_config)
         backbone.to(device)
         return backbone
 

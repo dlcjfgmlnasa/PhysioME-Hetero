@@ -37,19 +37,20 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 def get_args():
     parser = argparse.ArgumentParser()
     # Pretrained Checkpoint Hyperparameter
-    parser.add_argument('--base_path', default=os.path.join('..', 'data', 'sleep_edfx'), type=str)
-    parser.add_argument('--holdout_subject_size', default=30, type=int)
-    parser.add_argument('--test_size', default=0.30, type=float)
+    parser.add_argument('--base_path', default=os.path.join('..', 'data', 'vitaldb'), type=str)
+    parser.add_argument('--holdout_subject_size', default=100, type=int)
+    parser.add_argument('--test_size', default=0.20, type=float)
 
     parser.add_argument('--pretrain_ckpt_path',
-                        default=os.path.join('..', '..', 'ckpt', 'sleep_edfx', 'physiome'),
+                        default=os.path.join('..', '..', 'ckpt', 'vital_db', 'physiome'),
                         type=str)
-    parser.add_argument('--class_num', default=5, type=int)
+    parser.add_argument('--class_num', default=2, type=int)
 
-    # Modality 1 => ['EEG Fpz-Cz']
-    # Modality 2 => ['EEG Fpz-Cz', 'EOG horizontal']
-    # Modality 3 => ['EEG Fpz-Cz', 'EEG Pz-Oz', 'EOG horizontal']
-    parser.add_argument('--select_ch_names', default=['EEG Fpz-Cz'], type=List)
+    # VitalDB modalities. Combinations:
+    #   1 => ['ABP']
+    #   2 => ['ABP', 'ECG']
+    #   3 => ['ABP', 'ECG', 'PPG']
+    parser.add_argument('--select_ch_names', default=['ABP'], type=List)
     parser.add_argument('--sfreq', default=100, type=int)
 
     # Train Hyperparameter

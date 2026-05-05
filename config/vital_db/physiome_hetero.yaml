@@ -1,0 +1,78 @@
+# PhysioME-Hetero pretraining config for VitalDB.
+# Reads SSL pretraining data from ``ssl_data_dir`` (output of
+# dataset/data_parser/vital_db_ssl.py) and labeled IOH data from
+# ``labeled_data_dir`` (output of dataset/data_parser/vital_db.py) for
+# per-epoch linear-probe validation.
+
+ssl_data_dir: '../../data/vitaldb_ssl'
+labeled_data_dir: '../../data/vitaldb'
+
+# Subject split for SSL pretraining and labeled probing.
+# (group_cross_validation is called separately on each base_path.)
+holdout_subject_size: 100
+test_size: 0.20
+
+# Backbone unimodal checkpoints (same as the original physiome.yaml).
+modality_name2path:
+  'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
+  'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
+  'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
+
+# Signal config.
+sfreq: 100
+rfreq: 100
+data_scaler: false
+class_downsampling: true
+
+# DataLoader behaviour.
+dataloader_eager: false      # set true if all SSL npz files comfortably fit in RAM
+dataloader_normalize: true
+
+# Bucket-aware sampler.
+bucket_sampling: 'natural'   # 'natural' (proportional to bucket size) or 'uniform'
+bucket_min_size: 128         # buckets smaller than this are dropped (cannot fill a batch)
+
+# Optimisation.
+train_epochs: 50
+train_warmup_epoch: 1
+train_base_learning_rate: 0.0001
+train_batch_size: 128
+train_batch_accumulation: 1
+num_workers: 4
+
+# Architecture (matches the original physiome.yaml so that A1 baseline is comparable).
+second: 60
+time_window: 3
+time_step: 3
+backbone_embed_dim: 512
+backbone_num_frames: 20
+encoder_embed_dim: 512
+encoder_heads: 8
+encoder_depths: 4
+decoder_embed_dim: 256
+decoder_heads: 8
+decoder_depths: 3
+decoder_recon_depths: 8
+alpha: 1.0
+projection_hidden:
+  - 1024
+  - 512
+temperature: 0.1
+mask_ratio: 0.4
+
+# LoRA on the unimodal backbones.
+lora_r: 4
+lora_alpha: 16
+lora_dropout: 0.05
+
+# Hetero / availability-aware knobs (also used as ablation toggles).
+# True  -> v1 recipe: restoration loss only on fully-real-present batches.
+# False -> ablation A3: restoration on any batch with >=2 real-present modals;
+#          synth-drop one or more, naturally-absent slots get encoder context
+#          via dropped_modality_token but contribute zero loss.
+restoration_only_on_complete: true
+
+print_point: 20
+ckpt_path: '../../ckpt/vital_db_hetero/'
+model_name: 'physiome_hetero'
+seed: 777

@@ -19,8 +19,10 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 from dataset.utils import group_cross_validation
 from pretrained.dp_neuronet.data_loader import TorchDataset
-from pretrained.dp_neuronet.augmentation import DataAugmentationNeuroNet
 from models.dp_neuronet.model import NeuroNet
+# DataAugmentationNeuroNet (sleep-EEG style segment crop / permutation) is no
+# longer used — TF-C generates its two views internally via random masking on
+# the time and frequency domains.
 
 
 warnings.filterwarnings(action='ignore')
@@ -41,7 +43,7 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_yaml',
                         type=str,
-                        default=os.path.join('..', '..', 'config', 'sleep_edfx', 'dp_neuronet.yaml'))
+                        default=os.path.join('..', '..', 'config', 'vital_db', 'dp_neuronet.yaml'))
     return parser.parse_args()
 
 
@@ -70,7 +72,6 @@ class Trainer(object):
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.args.train_epochs)
         self.tensorboard_path = os.path.join(self.args.ckpt_path, self.args.model_name,
                                              self.args.ch_names[self.args.ch_idx], 'tensorboard')
-        self.transform = DataAugmentationNeuroNet(prob=args.data_augmentation_prob)
 
         # remote tensorboard files
         if os.path.exists(self.tensorboard_path):
@@ -108,11 +109,8 @@ class Trainer(object):
 
             for x, _ in train_dataloader:
                 x = x.to(device)
-                x1, x2 = self.transform(x.unsqueeze(dim=1))
-                x1, x2 = x1.squeeze(), x2.squeeze()
-                out = self.model(x1, x2, mask_ratio=self.args.mask_ratio)
-                recon_loss, contrastive_loss1, contrastive_loss2 = out
-                loss = recon_loss + contrastive_loss1 + contrastive_loss2
+                recon_loss, l_t, l_f, l_tf = self.model(x, mask_ratio=self.args.mask_ratio)
+                loss = recon_loss + l_t + l_f + l_tf
                 loss.backward()
 
                 if (step + 1) % self.args.train_batch_accumulation == 0:
@@ -121,15 +119,17 @@ class Trainer(object):
 
                 if (total_step + 1) % self.args.print_point == 0:
                     print('[Epoch] : {0:03d}  [Step] : {1:08d}  '
-                          '[Recon Loss] : {2:02.4f}  '
-                          '[Contra Loss 1] : {3:02.4f}  '
-                          '[Contra Loss 2] : {4:02.4f}  '
-                          '[Total Loss] : {5:02.4f}'.format(
-                            epoch, total_step + 1, recon_loss, contrastive_loss1, contrastive_loss2, loss))
+                          '[Recon] : {2:02.4f}  '
+                          '[L_T] : {3:02.4f}  '
+                          '[L_F] : {4:02.4f}  '
+                          '[L_TF] : {5:02.4f}  '
+                          '[Total] : {6:02.4f}'.format(
+                            epoch, total_step + 1, recon_loss, l_t, l_f, l_tf, loss))
 
                 self.tensorboard_writer.add_scalar('Reconstruction Loss', recon_loss, total_step)
-                self.tensorboard_writer.add_scalar('Contrastive Loss1', contrastive_loss1, total_step)
-                self.tensorboard_writer.add_scalar('Contrastive Loss2', contrastive_loss2, total_step)
+                self.tensorboard_writer.add_scalar('L_T (time-time)', l_t, total_step)
+                self.tensorboard_writer.add_scalar('L_F (freq-freq)', l_f, total_step)
+                self.tensorboard_writer.add_scalar('L_TF (cross-domain)', l_tf, total_step)
                 self.tensorboard_writer.add_scalar('Total Loss', loss, total_step)
 
                 step += 1

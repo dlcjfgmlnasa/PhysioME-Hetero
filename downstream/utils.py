@@ -1,110 +1,57 @@
 # -*- coding:utf-8 -*-
 import torch
-import torch.nn as nn
-from collections import OrderedDict
+
 from downstream.model import PhysioMEClassifier
-from models.synthnet.model12 import PhysioME
-from models.neuronet.model import NeuroNetEncoder
-from peft import get_peft_model, LoraConfig
+from models.dp_neuronet.model import NeuroNetEncoder
+from models.physiome.model import PhysioME
+from models.transformer import apply_lora
 
 
 def load_pretrained_to_classifier(ckpt_path: str, n_classes: int):
-    # Load PhysioME w/o Decoder
-    def get_find_parameter(model_state, find_name):
-        param_dict = OrderedDict()
-        for name_, param_ in model_state.items():
-            if name_.find(find_name) != -1:
-                param_dict[name_] = param_
-        return param_dict
+    """Load a PhysioME-Hetero checkpoint and wrap it in a classification head.
 
-    def change_parameter(pretrained_model_state, encoder_model, find_name):
-        old_param = get_find_parameter(model_state=pretrained_model_state, find_name=find_name)
-        new_param = encoder_model.state_dict()
-        new_param = {on: nv for on, nv in zip(new_param.keys(), old_param.values())}
-        return new_param
-
+    Returns ``(PhysioMEClassifier, (unimodal_param, multimodal_param))`` so that
+    callers can inspect the architecture parameters if needed.
+    """
     ckpt = torch.load(ckpt_path, map_location='cpu')
     ch_names = ckpt['ch_names']
-    unimodal_parameter, multimodal_parameter = ckpt['modality_backbone_param'], ckpt['entire_model_param']
-    multimodal_model_state = ckpt['model_state']
+    unimodal_param = ckpt['modality_backbone_param']
+    multimodal_param = ckpt['entire_model_param']
+    model_state = ckpt['model_state']
+    hyperparameter = ckpt['hyperparameter']
 
-    # 1. Load Unimodal (= NeuroNet) Pretrained Model
-    neuronet_pretrained_model = {}
+    # Build one LoRA-wrapped NeuroNetEncoder per modality (hand-rolled LoRA — see
+    # ``models/transformer/lora.py``). The wrap order matches the trainers'
+    # ``_load_pretrained_unimodal``: build encoder, then ``apply_lora``.
+    backbone_networks = {}
     for ch_name in ch_names:
-        neuronet = NeuroNetEncoder(**unimodal_parameter)
-        peft_config = LoraConfig(
-            r=ckpt['hyperparameter']['lora_r'], lora_alpha=ckpt['hyperparameter']['lora_alpha'],
-            lora_dropout=ckpt['hyperparameter']['lora_dropout'], bias='none',
-            use_rslora=True, init_lora_weights='gaussian',
-            target_modules=['attn.proj'],
+        encoder = NeuroNetEncoder(**unimodal_param)
+        encoder = apply_lora(
+            encoder,
+            target_attrs=('out_proj',),
+            r=hyperparameter['lora_r'],
+            alpha=hyperparameter['lora_alpha'],
+            dropout=hyperparameter['lora_dropout'],
+            rslora=True,
         )
-        neuronet = get_peft_model(model=neuronet, peft_config=peft_config)
-        neuronet_pretrained_model[ch_name] = neuronet
+        backbone_networks[ch_name] = encoder
 
-    # 2. Load PhysioME Classifier
-    backbone = PhysioMEClassifier(
-        backbone_networks=neuronet_pretrained_model,
-        backbone_embed_dim=multimodal_parameter['backbone_embed_dim'],
-        num_backbone_frames=multimodal_parameter['backbone_num_frames'],
-        encoder_embed_dim=multimodal_parameter['encoder_embed_dim'],
-        encoder_heads=multimodal_parameter['encoder_heads'],
-        encoder_depths=multimodal_parameter['encoder_depths'],
-        decoder_embed_dim=multimodal_parameter['decoder_embed_dim'],
-        decoder_heads=multimodal_parameter['decoder_heads'],
-        decoder_recon_depths=multimodal_parameter['decoder_recon_depths'],
-        n_classes=n_classes
+    # Reconstruct full PhysioME and load pretrained weights.
+    physio_me = PhysioME(
+        backbone_networks=backbone_networks,
+        backbone_embed_dim=multimodal_param['backbone_embed_dim'],
+        num_backbone_frames=multimodal_param['backbone_num_frames'],
+        encoder_embed_dim=multimodal_param['encoder_embed_dim'],
+        encoder_heads=multimodal_param['encoder_heads'],
+        encoder_depths=multimodal_param['encoder_depths'],
+        decoder_embed_dim=multimodal_param['decoder_embed_dim'],
+        decoder_heads=multimodal_param['decoder_heads'],
+        decoder_depths=multimodal_param['decoder_depths'],
+        decoder_recon_depths=multimodal_param['decoder_recon_depths'],
+        projection_hidden=multimodal_param['projection_hidden'],
+        temperature=multimodal_param['temperature'],
     )
-    # [Backbone Network]
-    backbone.backbone_networks.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.backbone_networks,
-        find_name='backbone_networks'
-    ))
-    backbone.backbone_embedded.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.backbone_embedded,
-        find_name='backbone_embedded'
-    ))
-    backbone.modal_token_dict.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.modal_token_dict,
-        find_name='modal_token_dict'
-    ))
+    physio_me.load_state_dict(model_state)
 
-    # [Multimodal Encoder]
-    backbone.multimodal_encoder_block.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.multimodal_encoder_block,
-        find_name='multimodal_encoder_block'
-    ))
-    backbone.multimodal_encoder_norm.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.multimodal_encoder_norm,
-        find_name='multimodal_encoder_norm'
-    ))
-
-    # [Multimodal Decoder - Restoration (for Missing Modality)]
-    backbone.recon_embed.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.recon_embed,
-        find_name='recon_embed'
-    ))
-    backbone.multimodal_recon_block_dict.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.multimodal_recon_block_dict,
-        find_name='multimodal_recon_block_dict'
-    ))
-    backbone.multimodal_recon_norm.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.multimodal_recon_norm,
-        find_name='multimodal_recon_norm'
-    ))
-    backbone.multimodal_recon_pred_dict.load_state_dict(change_parameter(
-        pretrained_model_state=multimodal_model_state,
-        encoder_model=backbone.multimodal_recon_pred_dict,
-        find_name='multimodal_recon_pred_dict'
-    ))
-    backbone.multimodal_encoder_pos_embed = nn.Parameter(multimodal_model_state['multimodal_encoder_pos_embed'])
-    backbone.multimodal_decoder_pos_embed = nn.Parameter(multimodal_model_state['multimodal_decoder_pos_embed'])
-    backbone.mask_token = nn.Parameter(multimodal_model_state['mask_token'])
-    return backbone, (unimodal_parameter, multimodal_parameter)
+    classifier = PhysioMEClassifier(physio_me=physio_me, n_classes=n_classes)
+    return classifier, (unimodal_param, multimodal_param)

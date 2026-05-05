@@ -1,0 +1,63 @@
+# Ablation A3: restoration_only_on_complete = false
+# All other settings identical to physiome_hetero.yaml.
+# Train with: python pretrained/physiome/train_hetero.py --config_yaml config/vital_db/physiome_hetero_a3.yaml
+
+ssl_data_dir: '../../data/vitaldb_ssl'
+labeled_data_dir: '../../data/vitaldb'
+
+holdout_subject_size: 100
+test_size: 0.20
+
+modality_name2path:
+  'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
+  'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
+  'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
+
+sfreq: 100
+rfreq: 100
+data_scaler: false
+class_downsampling: true
+
+dataloader_eager: false
+dataloader_normalize: true
+
+bucket_sampling: 'natural'
+bucket_min_size: 128
+
+train_epochs: 50
+train_warmup_epoch: 1
+train_base_learning_rate: 0.0001
+train_batch_size: 128
+train_batch_accumulation: 1
+num_workers: 4
+
+second: 60
+time_window: 3
+time_step: 3
+backbone_embed_dim: 512
+backbone_num_frames: 20
+encoder_embed_dim: 512
+encoder_heads: 8
+encoder_depths: 4
+decoder_embed_dim: 256
+decoder_heads: 8
+decoder_depths: 3
+decoder_recon_depths: 8
+alpha: 1.0
+projection_hidden:
+  - 1024
+  - 512
+temperature: 0.1
+mask_ratio: 0.4
+
+lora_r: 4
+lora_alpha: 16
+lora_dropout: 0.05
+
+# A3 ablation toggle: enable restoration on incomplete (partial-real) batches.
+restoration_only_on_complete: false
+
+print_point: 20
+ckpt_path: '../../ckpt/vital_db_hetero_a3/'
+model_name: 'physiome_hetero_a3'
+seed: 777

@@ -2,7 +2,6 @@
 import torch
 import math
 import numpy as np
-import torch.nn.functional as f
 
 
 def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -74,39 +73,6 @@ def get_2d_sincos_pos_embed_flexible(embed_dim, grid_size, cls_token=False):
     if cls_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
-
-
-def interpolate_1d_pos_embed(pos_embed, target_len, cls_token=True):
-    """
-    Interpolates 1D positional embeddings to match the input sequence length.
-
-    Args:
-        pos_embed (Tensor): Positional embedding of shape [1, N+1, D] (if cls_token=True) or [1, N, D].
-        target_len (int): Number of patch tokens (excluding cls token).
-        cls_token (bool): Whether the first token is a class token.
-
-    Returns:
-        Tensor: Interpolated positional embedding of shape [1, target_len + int(cls_token), D]
-    """
-    if cls_token:
-        class_pos_embed = pos_embed[:, 0]         # [1, D]
-        patch_pos_embed = pos_embed[:, 1:]        # [1, N, D]
-    else:
-        patch_pos_embed = pos_embed               # [1, N, D]
-
-    patch_pos_embed = patch_pos_embed.permute(0, 2, 1)  # [1, D, N]
-    patch_pos_embed = f.interpolate(
-        patch_pos_embed,
-        size=target_len,
-        mode='linear',
-        align_corners=False
-    )
-    patch_pos_embed = patch_pos_embed.permute(0, 2, 1)  # [1, target_len, D]
-
-    if cls_token:
-        return torch.cat((class_pos_embed.unsqueeze(1), patch_pos_embed), dim=1)  # [1, target_len+1, D]
-    else:
-        return patch_pos_embed  # [1, target_len, D]
 
 
 def model_size(model):
