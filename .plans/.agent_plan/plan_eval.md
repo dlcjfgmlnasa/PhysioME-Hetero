@@ -1,7 +1,7 @@
 # Plan: Evaluation — PhysioME-Hetero
 
 > 본 파일은 **estimator** 에이전트의 평가 기준입니다. 항상 이 파일을 먼저 읽고 평가를 수행하세요.
-> Single source of truth: `notes/논문 PhysioME-Hetero/MOC.md` 와 `07. Ablation 3종.md`, `08. External transfer.md`, `09. JBHI 체크리스트.md`.
+> Single source of truth: `physiome_hetero/00_MOC.md` 와 `physiome_hetero/05_Downstream/Ablations_A1_A2_A3.md`, `physiome_hetero/04_Data/MIMIC3_WDB_Transfer.md`, `physiome_hetero/90_Paper/PhysioME-Hetero/09. JBHI 체크리스트.md`.
 
 ---
 

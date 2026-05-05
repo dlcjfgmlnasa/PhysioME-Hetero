@@ -1,7 +1,7 @@
 # Plan: Data Engineering — PhysioME-Hetero
 
 > 본 파일은 **data-engineer** 에이전트의 작업 가이드입니다. 항상 이 파일을 먼저 읽고 다음 미완료 태스크를 실행하세요.
-> Single source of truth: `notes/논문 PhysioME-Hetero/MOC.md` 와 그 하위 노트들.
+> Single source of truth: `physiome_hetero/00_MOC.md` 와 그 하위 노트들 (특히 `01_Overview/Master_Plan.md`).
 
 ---
 

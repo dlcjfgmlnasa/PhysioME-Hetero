@@ -71,5 +71,5 @@ tags: [hub, paper]
 
 ## 원본
 
-- Drafts: `notes/90_Paper/PhysioME-Hetero/*.md`
-- Baseline: `notes/90_Paper/PhysioME-Original/*.md`
+- Drafts: `physiome_hetero/90_Paper/PhysioME-Hetero/*.md`
+- Baseline: `physiome_hetero/90_Paper/PhysioME-Original/*.md`

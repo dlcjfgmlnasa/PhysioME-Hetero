@@ -40,5 +40,5 @@ tags: [hub, notes]
 
 ## 원본
 
-- Status notes: `notes/91_Notes/Status_*.md`
-- 저자 메모: `notes/91_Notes/References/`
+- Status notes: `physiome_hetero/91_Notes/Status_*.md`
+- 저자 메모: `physiome_hetero/91_Notes/References/`
