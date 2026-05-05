@@ -21,6 +21,7 @@ class_downsampling: true
 
 dataloader_eager: false
 dataloader_normalize: true
+shard_cache_size: 4
 
 bucket_sampling: 'natural'
 bucket_min_size: 128

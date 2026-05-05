@@ -49,7 +49,7 @@ from pretrained.physiome.hetero_data_loader import (
     MODAL_ORDER,
     BucketBatchSampler,
     HeteroVitalDBDataset,
-    find_ssl_npz_paths,
+    find_ssl_data_dir,
     hetero_collate_fn,
 )
 from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
@@ -89,14 +89,9 @@ class HeteroTrainer:
 
         self.ch_names: List[str] = list(MODAL_ORDER)
 
-        # SSL pretraining paths (hetero parser output)
-        ssl_paths_all = find_ssl_npz_paths(args.ssl_data_dir)
-        if not ssl_paths_all:
-            raise FileNotFoundError(
-                f'No SSL npz files in {args.ssl_data_dir}. '
-                f'Run dataset/data_parser/vital_db_ssl.py first.'
-            )
-        self.ssl_train_paths = ssl_paths_all
+        # SSL pretraining shards (hetero parser output) — manifest sanity check.
+        find_ssl_data_dir(args.ssl_data_dir)  # raises with friendly message
+        self.ssl_data_dir = args.ssl_data_dir
 
         # Labeled probe paths (original IOH parser output, complete-modality)
         self.labeled_train_paths, self.labeled_val_paths, self.labeled_eval_paths = \
@@ -132,7 +127,7 @@ class HeteroTrainer:
         print(f'   >> Modal Names      : {", ".join(self.ch_names)}')
         print(f'   >> Model Size       : {model_size(self.model):.2f} MB')
         print(f'   >> Learning rate    : {self.lr}')
-        print(f'   >> SSL train cases  : {len(self.ssl_train_paths)}')
+        print(f'   >> SSL data dir     : {self.ssl_data_dir}')
         print(f'   >> Labeled subjects : '
               f'{len(self.labeled_train_paths)} train / '
               f'{len(self.labeled_val_paths)} val / '
@@ -197,9 +192,13 @@ class HeteroTrainer:
     # ------------------------------------------------------------------
     def train(self):
         ssl_dataset = HeteroVitalDBDataset(
-            self.ssl_train_paths,
+            self.ssl_data_dir,
             eager=self.args.dataloader_eager,
             normalize=self.args.dataloader_normalize,
+            shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
+        )
+        self._ssl_dataset_stats = (
+            ssl_dataset.num_shards, len(ssl_dataset), ssl_dataset.num_cases,
         )
         sampler = BucketBatchSampler(
             ssl_dataset.segment_bitmap_keys,

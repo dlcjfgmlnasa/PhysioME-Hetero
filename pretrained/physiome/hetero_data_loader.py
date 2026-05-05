@@ -1,17 +1,30 @@
 # -*- coding:utf-8 -*-
 """Heterogeneous-availability dataset / dataloader for VitalDB SSL pretraining.
 
-Reads npz files produced by ``dataset/data_parser/vital_db_ssl.py`` and
-provides:
+Reads the sharded output of ``dataset/data_parser/vital_db_ssl.py``:
 
+    <data_dir>/
+        manifest.json           # index over all shards (built by ShardWriter)
+        shard_0000.npz          # ~segments_per_shard segments concatenated
+        shard_0001.npz
+        ...
+
+Each shard packs many cases worth of segments into one compressed npz so that
+init / per-batch I/O on slow network filesystems amortises across many segments
+instead of hitting one tiny file per case.
+
+Public components
+-----------------
 * ``HeteroVitalDBDataset`` — flat segment dataset. ``__getitem__`` returns one
-  (segment, mask, presence_state) triple regardless of bucket.
+  ``(segment, mask, presence_state)`` triple regardless of bucket.
 * ``BucketBatchSampler`` — yields batches in which every sample shares the same
   segment-level modality-availability bitmap, so a single batch corresponds to
   one bucket. Sampling weights across buckets are configurable.
 * ``hetero_collate_fn`` — turns a homogeneous-bucket batch into the
   ``data: dict[str, Tensor]`` form that ``PhysioME.forward`` expects, plus
   ``mask`` and ``presence_state`` tensors.
+* ``find_ssl_data_dir`` — sanity-check that ``manifest.json`` lives under the
+  given dir; returns the manifest path.
 
 Presence-state encoding is the contract used by ``PhysioME.forward`` (after the
 loss-decomposition refactor in Task 4):
@@ -22,8 +35,9 @@ loss-decomposition refactor in Task 4):
 """
 from __future__ import annotations
 
-import glob
+import json
 import os
+from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +52,8 @@ PRESENCE_REAL: int = 0
 PRESENCE_SYNTH_DROPPED: int = 1
 PRESENCE_NATURALLY_ABSENT: int = 2
 
+MANIFEST_NAME: str = 'manifest.json'
+
 
 def _bitmap_to_key(bitmap: Sequence[bool]) -> str:
     return ''.join('1' if b else '0' for b in bitmap)
@@ -47,45 +63,83 @@ def _key_to_bitmap(key: str) -> np.ndarray:
     return np.array([c == '1' for c in key], dtype=bool)
 
 
-class HeteroVitalDBDataset(Dataset):
-    """Flat segment dataset over npz files produced by ``vital_db_ssl.py``.
+def find_ssl_data_dir(data_dir: str) -> str:
+    """Return the manifest path under ``data_dir``; raise if absent.
 
-    Loads metadata (per-segment masks, file pointers) eagerly so that
-    bucket assignment is cheap. Segment payloads are loaded on demand from
-    a per-file cache, so RAM usage stays bounded for large pretraining sets.
+    Kept as a thin helper so trainer code can produce a friendly error message
+    when the user forgot to (re)run the parser.
+    """
+    manifest_path = os.path.join(data_dir, MANIFEST_NAME)
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(
+            f'No manifest at {manifest_path!r}. '
+            f'Run dataset/data_parser/vital_db_ssl.py first to populate '
+            f'{data_dir!r} with shard_*.npz + manifest.json.'
+        )
+    return manifest_path
+
+
+class HeteroVitalDBDataset(Dataset):
+    """Flat segment dataset over shard files produced by ``vital_db_ssl.py``.
+
+    Loads only the manifest at init time (cheap — one small JSON read), then
+    fetches shard payloads on demand into a small LRU cache. ``__getitem__``
+    returns one normalised segment.
 
     Args:
-        paths: list of npz file paths (one per case).
-        eager: if True, load all segment payloads into memory at init time.
-            Recommended only when the dataset comfortably fits in RAM.
+        data_dir: directory containing ``manifest.json`` + ``shard_NNNN.npz``.
+        eager: if True, load every shard into memory at init time. Recommended
+            only when the full dataset comfortably fits in RAM.
         normalize: if True, z-score each modality channel within a segment.
             Done at ``__getitem__`` time. Missing modalities (mask=False) are
             left as zeros.
+        shard_cache_size: max number of shards held in the LRU cache (lazy
+            mode only). Default 4 shards; tune up for large RAM, down for tight.
     """
 
-    def __init__(self, paths: Sequence[str], eager: bool = False,
-                 normalize: bool = True):
-        self.paths: List[str] = list(paths)
+    def __init__(self, data_dir: str, eager: bool = False,
+                 normalize: bool = True, shard_cache_size: int = 4):
+        self.data_dir = data_dir
         self.eager = eager
         self.normalize = normalize
+        self.shard_cache_size = max(1, int(shard_cache_size))
 
-        self._segment_index: List[Tuple[int, int]] = []  # (file_idx, seg_idx)
+        manifest_path = find_ssl_data_dir(data_dir)
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+
+        modal_order = list(manifest.get('modal_order', MODAL_ORDER))
+        if modal_order != MODAL_ORDER:
+            raise RuntimeError(
+                f'Manifest modal_order {modal_order} does not match '
+                f'dataset MODAL_ORDER {MODAL_ORDER}. Re-run the parser '
+                f'or update MODAL_ORDER consistently.'
+            )
+
+        self._shards: List[dict] = manifest['shards']
+        if not self._shards:
+            raise RuntimeError(f'Manifest at {manifest_path} has zero shards.')
+
+        # Flat segment index: (shard_idx, local_seg_idx).
+        self._segment_index: List[Tuple[int, int]] = []
         self._segment_bitmap_keys: List[str] = []
-        self._eager_x: Optional[List[np.ndarray]] = [] if eager else None
-        self._eager_mask: Optional[List[np.ndarray]] = [] if eager else None
-        self._lazy_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-        self._lazy_cache_max = 64  # keep at most this many file handles
+        for si, shard in enumerate(self._shards):
+            keys = shard['bitmap_keys']
+            n = int(shard['n_segments'])
+            if len(keys) != n:
+                raise RuntimeError(
+                    f'Shard {shard["path"]} reports n_segments={n} but '
+                    f'manifest has {len(keys)} bitmap_keys.'
+                )
+            for li in range(n):
+                self._segment_index.append((si, li))
+                self._segment_bitmap_keys.append(keys[li])
 
-        for fi, p in enumerate(self.paths):
-            with np.load(p, allow_pickle=True) as arr:
-                masks = np.asarray(arr['mask'], dtype=bool)
-                if eager:
-                    xs = np.asarray(arr['x'], dtype=np.float32)
-                    self._eager_x.append(xs)
-                    self._eager_mask.append(masks)
-            for si in range(masks.shape[0]):
-                self._segment_index.append((fi, si))
-                self._segment_bitmap_keys.append(_bitmap_to_key(masks[si]))
+        # Shard payload storage.
+        self._eager_shards: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
+        self._lazy_cache: 'OrderedDict[int, Tuple[np.ndarray, np.ndarray]]' = OrderedDict()
+        if eager:
+            self._eager_shards = [self._read_shard(si) for si in range(len(self._shards))]
 
     def __len__(self) -> int:
         return len(self._segment_index)
@@ -94,24 +148,41 @@ class HeteroVitalDBDataset(Dataset):
     def segment_bitmap_keys(self) -> List[str]:
         return self._segment_bitmap_keys
 
-    def _load_file(self, file_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.eager:
-            return self._eager_x[file_idx], self._eager_mask[file_idx]
-        if file_idx in self._lazy_cache:
-            return self._lazy_cache[file_idx]
-        with np.load(self.paths[file_idx], allow_pickle=True) as arr:
+    @property
+    def num_shards(self) -> int:
+        return len(self._shards)
+
+    @property
+    def num_cases(self) -> int:
+        return int(sum(int(s.get('n_cases', 0)) for s in self._shards))
+
+    # ---------------- shard I/O ----------------
+    def _read_shard(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        path = os.path.join(self.data_dir, self._shards[shard_idx]['path'])
+        with np.load(path, allow_pickle=True) as arr:
             xs = np.asarray(arr['x'], dtype=np.float32)
             masks = np.asarray(arr['mask'], dtype=bool)
-        if len(self._lazy_cache) >= self._lazy_cache_max:
-            self._lazy_cache.pop(next(iter(self._lazy_cache)))
-        self._lazy_cache[file_idx] = (xs, masks)
         return xs, masks
 
+    def _load_shard(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if self._eager_shards is not None:
+            return self._eager_shards[shard_idx]
+        cached = self._lazy_cache.get(shard_idx)
+        if cached is not None:
+            self._lazy_cache.move_to_end(shard_idx)
+            return cached
+        payload = self._read_shard(shard_idx)
+        self._lazy_cache[shard_idx] = payload
+        while len(self._lazy_cache) > self.shard_cache_size:
+            self._lazy_cache.popitem(last=False)
+        return payload
+
+    # ---------------- access ----------------
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        file_idx, seg_idx = self._segment_index[idx]
-        xs, masks = self._load_file(file_idx)
-        x = xs[seg_idx].copy()  # [C, T]
-        mask = masks[seg_idx].copy()  # [C]
+        shard_idx, seg_idx = self._segment_index[idx]
+        xs, masks = self._load_shard(shard_idx)
+        x = xs[seg_idx].copy()       # [C, T]
+        mask = masks[seg_idx].copy() # [C]
 
         if self.normalize:
             for c in range(x.shape[0]):
@@ -285,36 +356,34 @@ def hetero_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict:
     }
 
 
-def find_ssl_npz_paths(data_dir: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(data_dir, '*.npz')))
-
-
 if __name__ == '__main__':
-    # Quick offline sanity check using synthetic npz files.
+    # Quick offline sanity check using the parser's ShardWriter on synthetic data.
     import tempfile
+
+    # Local import to avoid pulling vitaldb at module import time.
+    from dataset.data_parser.vital_db_ssl import ShardWriter
 
     with tempfile.TemporaryDirectory() as tmp:
         rng = np.random.default_rng(0)
+        writer = ShardWriter(tmp, MODAL_ORDER, segments_per_shard=64,
+                             compress=True)
         for case_idx in range(20):
             n_seg = int(rng.integers(5, 15))
             x = rng.standard_normal((n_seg, NUM_MODALS, 6000)).astype(np.float32)
             mask = np.zeros((n_seg, NUM_MODALS), dtype=bool)
             for s in range(n_seg):
-                pattern = rng.integers(1, 8)
+                pattern = rng.integers(1, 1 << NUM_MODALS)
                 for k in range(NUM_MODALS):
                     mask[s, k] = bool((pattern >> k) & 1)
-            np.savez(os.path.join(tmp, f'case_{case_idx:03d}.npz'),
-                     x=x, mask=mask,
-                     modal_names=np.array(MODAL_ORDER),
-                     subject_modality_set=mask.any(axis=0),
-                     case_id=f'case_{case_idx:03d}')
+            writer.add_case(f'case_{case_idx:03d}', x, mask, mask.any(axis=0))
+        writer.close(extra_meta={'sfreq': 100, 'duration': 60})
 
-        paths = find_ssl_npz_paths(tmp)
-        ds = HeteroVitalDBDataset(paths, eager=True, normalize=True)
+        ds = HeteroVitalDBDataset(tmp, eager=True, normalize=True)
         sampler = BucketBatchSampler(ds.segment_bitmap_keys, batch_size=4,
                                      sampling='uniform', min_bucket_size=4)
         from torch.utils.data import DataLoader
         loader = DataLoader(ds, batch_sampler=sampler, collate_fn=hetero_collate_fn)
+        print(f'shards: {ds.num_shards}, segments: {len(ds)}, cases: {ds.num_cases}')
         for i, batch in enumerate(loader):
             print(f'batch {i}: bucket={batch["bucket_pattern"]!r} '
                   f'modals={list(batch["data"].keys())} '

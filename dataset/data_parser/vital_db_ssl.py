@@ -1,12 +1,11 @@
 # -*- coding:utf-8 -*-
-"""SSL pretraining parser for VitalDB.
+"""SSL pretraining parser for VitalDB (sharded output).
 
 Differences vs ``dataset/data_parser/vital_db.py``:
   1. No 2-minute lookahead validation — every valid window is an SSL sample.
   2. No ``is_all_in`` subject-level filter — subjects with any non-empty
-     subset of {ABP, ECG, PPG} contribute data.
-  3. Each segment carries a per-modality validity mask, so heterogeneous
-     bucket sampling is downstream-friendly.
+     subset of {ABP, ECG, PPG, CVP} contribute data.
+  3. Each segment carries a per-modality validity mask.
   4. Per-signal preprocessing pipeline (range check → spike detection →
      median → notch → bandpass/lowpass) ported from
      references/Biosignal-Foundation-Model.
@@ -15,18 +14,41 @@ Differences vs ``dataset/data_parser/vital_db.py``:
        (b) generic quality score (flatline / clip / hf / amplitude) per signal,
        (c) physiology-aware domain check (HR + autocorr regularity etc.).
 
-Output (per case, one ``.npz``):
-    x: float32 [T, M, sfreq * duration], zero where ``mask[t, m] == False``.
-    mask: bool [T, M] — per-segment, per-modality validity.
+Output layout (under ``trg_path``) — sharded for slow network filesystems:
+
+    shard_0000.npz, shard_0001.npz, ...   # ~``segments_per_shard`` segments each
+    manifest.json                          # index over all shards
+
+Each shard npz contains:
+    x: float32 [N, M, sfreq * duration] — concatenated segments, zero where mask=False.
+    mask: bool [N, M] — per-segment, per-modality validity.
+    case_ids: object [N] — case id of each segment.
+    case_offsets: int64 [K + 1] — segment index boundaries per case.
+    case_ids_unique: object [K] — unique case ids in this shard, ordered by offsets.
+    subject_modality_set: bool [K, M] — recording-level modality presence per case.
     modal_names: object [M] — fixed order from ``MODAL_ORDER``.
-    subject_modality_set: bool [M] — modalities present anywhere in the recording.
-    case_id: str
+
+manifest.json schema:
+    {
+        "version": 1,
+        "modal_order": [...],
+        "sfreq": int, "duration": int,
+        "shards": [
+            {"path": "shard_NNNN.npz", "n_segments": N, "n_cases": K,
+             "bitmap_keys": ["1111", "1110", ...]},
+            ...
+        ],
+        "total_segments": int,
+        "total_cases": int,
+        "bucket_counts": {"1111": int, "1110": int, ...}   // segment-level
+    }
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from typing import Dict
+from typing import Dict, List, Optional
 
 import numpy as np
 import tqdm
@@ -58,6 +80,10 @@ MODAL_TO_SIGNAL_KEY: Dict[str, str] = {
 }
 MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CVP']
 
+MANIFEST_NAME = 'manifest.json'
+MANIFEST_VERSION = 1
+DEFAULT_SEGMENTS_PER_SHARD = 2048
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -69,6 +95,12 @@ def get_args():
     parser.add_argument('--duration', type=int, default=60,
                         help='window length in seconds')
     parser.add_argument('--nan_max_ratio', type=float, default=0.1)
+    parser.add_argument('--segments_per_shard', type=int,
+                        default=DEFAULT_SEGMENTS_PER_SHARD,
+                        help='target number of segments per shard file '
+                             '(~96 KB raw / segment at 100Hz × 60s × 4ch float32)')
+    parser.add_argument('--no_compress', action='store_true',
+                        help='write shards uncompressed (faster CPU, larger files)')
     parser.add_argument('--skip_preprocess', action='store_true',
                         help='disable per-channel preprocessing pipeline '
                              '(useful when input is already preprocessed)')
@@ -178,16 +210,171 @@ def extract_segments(data_per_modal: Dict[str, np.ndarray],
     return xs[:kept], masks[:kept]
 
 
+def _bitmap_to_key(bitmap) -> str:
+    return ''.join('1' if b else '0' for b in bitmap)
+
+
+class ShardWriter:
+    """Buffer per-case segments and flush them as concatenated shard files.
+
+    Designed to amortise the cost of writing to slow network drives: instead of
+    one tiny ``.npz`` per case (thousands of metadata round-trips) we batch
+    ~``segments_per_shard`` segments into a single compressed shard.
+
+    Usage::
+
+        writer = ShardWriter(trg_path, MODAL_ORDER, segments_per_shard=2048)
+        for case_id, xs, masks, subj_set in cases:
+            writer.add_case(case_id, xs, masks, subj_set)
+        writer.close(extra_meta={'sfreq': 100, 'duration': 60})
+
+    ``close()`` writes ``manifest.json`` describing every shard, including
+    per-segment bitmap keys so that ``HeteroVitalDBDataset`` can build its
+    bucket sampler without re-reading any shard payload.
+    """
+
+    def __init__(self, trg_path: str, modal_order: List[str],
+                 segments_per_shard: int = DEFAULT_SEGMENTS_PER_SHARD,
+                 compress: bool = True):
+        self.trg_path = trg_path
+        self.modal_order = list(modal_order)
+        self.segments_per_shard = int(segments_per_shard)
+        self.compress = bool(compress)
+        os.makedirs(trg_path, exist_ok=True)
+
+        self._buf_xs: List[np.ndarray] = []
+        self._buf_masks: List[np.ndarray] = []
+        self._buf_case_ids: List[str] = []        # one entry per case in the buffer
+        self._buf_case_n_seg: List[int] = []      # segments contributed per case
+        self._buf_subject_set: List[np.ndarray] = []
+        self._buf_total_segments: int = 0
+
+        self._shards: List[dict] = []             # manifest entries
+        self._bucket_counts: Dict[str, int] = {}  # global, segment-level
+        self._total_segments: int = 0
+        self._total_cases: int = 0
+
+    # ---------------- buffering ----------------
+    def add_case(self, case_id: str, xs: np.ndarray, masks: np.ndarray,
+                 subject_modality_set: np.ndarray) -> None:
+        if xs.shape[0] == 0:
+            return
+        if xs.shape[1] != len(self.modal_order):
+            raise ValueError(
+                f'add_case: xs has {xs.shape[1]} modals but writer was built '
+                f'for {len(self.modal_order)} ({self.modal_order})'
+            )
+        self._buf_xs.append(np.ascontiguousarray(xs, dtype=np.float32))
+        self._buf_masks.append(np.ascontiguousarray(masks, dtype=bool))
+        self._buf_case_ids.append(str(case_id))
+        self._buf_case_n_seg.append(int(xs.shape[0]))
+        self._buf_subject_set.append(
+            np.ascontiguousarray(subject_modality_set, dtype=bool)
+        )
+        self._buf_total_segments += int(xs.shape[0])
+        self._total_cases += 1
+        if self._buf_total_segments >= self.segments_per_shard:
+            self._flush()
+
+    # ---------------- flush ----------------
+    def _flush(self) -> None:
+        if self._buf_total_segments == 0:
+            return
+        shard_idx = len(self._shards)
+        shard_name = f'shard_{shard_idx:04d}.npz'
+        shard_path = os.path.join(self.trg_path, shard_name)
+
+        xs = np.concatenate(self._buf_xs, axis=0)        # [N, M, T]
+        masks = np.concatenate(self._buf_masks, axis=0)  # [N, M]
+        case_offsets = np.zeros(len(self._buf_case_n_seg) + 1, dtype=np.int64)
+        case_offsets[1:] = np.cumsum(self._buf_case_n_seg, dtype=np.int64)
+        case_ids_per_seg = np.empty(xs.shape[0], dtype=object)
+        for k, (cid, n) in enumerate(zip(self._buf_case_ids, self._buf_case_n_seg)):
+            case_ids_per_seg[case_offsets[k]:case_offsets[k] + n] = cid
+        case_ids_unique = np.array(self._buf_case_ids, dtype=object)
+        subject_set = np.stack(self._buf_subject_set, axis=0)  # [K, M]
+
+        save_fn = np.savez_compressed if self.compress else np.savez
+        save_fn(
+            shard_path,
+            x=xs, mask=masks,
+            case_ids=case_ids_per_seg,
+            case_offsets=case_offsets,
+            case_ids_unique=case_ids_unique,
+            subject_modality_set=subject_set,
+            modal_names=np.array(self.modal_order),
+        )
+
+        bitmap_keys = [_bitmap_to_key(m) for m in masks]
+        for k in bitmap_keys:
+            self._bucket_counts[k] = self._bucket_counts.get(k, 0) + 1
+
+        self._shards.append({
+            'path': shard_name,
+            'n_segments': int(xs.shape[0]),
+            'n_cases': int(len(self._buf_case_ids)),
+            'bitmap_keys': bitmap_keys,
+        })
+        self._total_segments += int(xs.shape[0])
+
+        self._buf_xs.clear(); self._buf_masks.clear()
+        self._buf_case_ids.clear(); self._buf_case_n_seg.clear()
+        self._buf_subject_set.clear()
+        self._buf_total_segments = 0
+
+    def close(self, extra_meta: Optional[Dict] = None) -> str:
+        """Flush any remaining buffered cases and write manifest. Returns path."""
+        self._flush()
+        manifest = {
+            'version': MANIFEST_VERSION,
+            'modal_order': list(self.modal_order),
+            'segments_per_shard': self.segments_per_shard,
+            'compressed': self.compress,
+            'shards': self._shards,
+            'total_segments': self._total_segments,
+            'total_cases': self._total_cases,
+            'bucket_counts': self._bucket_counts,
+        }
+        if extra_meta:
+            for k, v in extra_meta.items():
+                manifest[k] = v
+        manifest_path = os.path.join(self.trg_path, MANIFEST_NAME)
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+        return manifest_path
+
+    # ---------------- introspection ----------------
+    @property
+    def bucket_counts(self) -> Dict[str, int]:
+        return dict(self._bucket_counts)
+
+    @property
+    def total_segments(self) -> int:
+        return self._total_segments
+
+    @property
+    def total_cases(self) -> int:
+        return self._total_cases
+
+    @property
+    def num_shards(self) -> int:
+        return len(self._shards)
+
+
 def vitaldb_ssl_converter(src_path: str, trg_path: str,
                           sfreq: int = 100, duration: int = 60,
                           nan_max_ratio: float = 0.1,
+                          segments_per_shard: int = DEFAULT_SEGMENTS_PER_SHARD,
+                          compress: bool = True,
                           skip_preprocess: bool = False) -> None:
     import vitaldb  # imported lazily so validate_segment can be used without it
-    os.makedirs(trg_path, exist_ok=True)
     paths = sorted(os.listdir(src_path))
 
-    saved, skipped = 0, 0
-    bucket_counts: Dict[str, int] = {}
+    writer = ShardWriter(
+        trg_path=trg_path, modal_order=MODAL_ORDER,
+        segments_per_shard=segments_per_shard, compress=compress,
+    )
+    skipped = 0
 
     for fname in tqdm.tqdm(paths, desc='VitalDB-SSL'):
         case_id = os.path.splitext(fname)[0]
@@ -234,23 +421,22 @@ def vitaldb_ssl_converter(src_path: str, trg_path: str,
         subject_modality_set = np.array(
             [m in present_modals for m in MODAL_ORDER], dtype=bool,
         )
-        np.savez(
-            os.path.join(trg_path, case_id + '.npz'),
-            x=xs, mask=masks,
-            modal_names=np.array(MODAL_ORDER),
-            subject_modality_set=subject_modality_set,
-            case_id=case_id,
-        )
+        writer.add_case(case_id, xs, masks, subject_modality_set)
 
-        bucket_key = ''.join('1' if subject_modality_set[i] else '0'
-                             for i in range(len(MODAL_ORDER)))
-        bucket_counts[bucket_key] = bucket_counts.get(bucket_key, 0) + 1
-        saved += 1
+    manifest_path = writer.close(extra_meta={
+        'sfreq': int(sfreq), 'duration': int(duration),
+        'nan_max_ratio': float(nan_max_ratio),
+        'preprocess': not skip_preprocess,
+    })
 
-    print(f'[VitalDB-SSL] saved={saved}, skipped={skipped}')
-    print(f'[VitalDB-SSL] bucket counts (ABP-ECG-PPG presence bitmap):')
-    for k in sorted(bucket_counts.keys()):
-        print(f'    {k}: {bucket_counts[k]}')
+    print(f'[VitalDB-SSL] saved={writer.total_cases} cases / '
+          f'{writer.total_segments} segments / {writer.num_shards} shards, '
+          f'skipped={skipped}')
+    print(f'[VitalDB-SSL] manifest: {manifest_path}')
+    print(f'[VitalDB-SSL] segment-level bucket counts '
+          f'(bitmap = {"".join(MODAL_ORDER)}):')
+    for k in sorted(writer.bucket_counts.keys()):
+        print(f'    {k}: {writer.bucket_counts[k]}')
 
 
 if __name__ == '__main__':
@@ -261,5 +447,7 @@ if __name__ == '__main__':
         sfreq=args.sfreq,
         duration=args.duration,
         nan_max_ratio=args.nan_max_ratio,
+        segments_per_shard=args.segments_per_shard,
+        compress=not args.no_compress,
         skip_preprocess=args.skip_preprocess,
     )

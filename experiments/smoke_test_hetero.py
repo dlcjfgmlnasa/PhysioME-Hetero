@@ -32,11 +32,11 @@ from models.physiome.model import (  # noqa: E402
     PRESENCE_NATURALLY_ABSENT,
     PhysioME,
 )
+from dataset.data_parser.vital_db_ssl import ShardWriter  # noqa: E402
 from pretrained.physiome.hetero_data_loader import (  # noqa: E402
     MODAL_ORDER,
     BucketBatchSampler,
     HeteroVitalDBDataset,
-    find_ssl_npz_paths,
     hetero_collate_fn,
 )
 
@@ -62,7 +62,11 @@ class ToyBackbone(nn.Module):
 
 
 def synthesise_dataset(tmp_dir: str, num_cases: int, sfreq: int, duration: int,
-                       rng: np.random.Generator) -> None:
+                       rng: np.random.Generator,
+                       segments_per_shard: int = 64) -> None:
+    """Generate synthetic shard files via ``ShardWriter`` so the smoke test
+    exercises the same on-disk layout the production parser writes.
+    """
     expected = sfreq * duration
     n_modals = len(MODAL_ORDER)
     # Every non-empty subset bitmap of length n_modals (e.g. for 4 modal:
@@ -73,6 +77,10 @@ def synthesise_dataset(tmp_dir: str, num_cases: int, sfreq: int, duration: int,
         for i in range(1, 1 << n_modals)
     ]
     full_bm = '1' * n_modals  # complete bucket — ensures miss_recon fires
+
+    writer = ShardWriter(tmp_dir, MODAL_ORDER,
+                         segments_per_shard=segments_per_shard, compress=True)
+
     for ci in range(num_cases):
         # Pick a random subject-level availability bitmap. First few cases
         # are forced to the complete bucket so the synth-drop restoration
@@ -104,13 +112,9 @@ def synthesise_dataset(tmp_dir: str, num_cases: int, sfreq: int, duration: int,
                 if not mask[s, m_idx]:
                     x[s, m_idx] = 0.0
 
-        np.savez(
-            os.path.join(tmp_dir, f'case_{ci:04d}.npz'),
-            x=x, mask=mask,
-            modal_names=np.array(MODAL_ORDER),
-            subject_modality_set=subject_modality_set,
-            case_id=f'case_{ci:04d}',
-        )
+        writer.add_case(f'case_{ci:04d}', x, mask, subject_modality_set)
+
+    writer.close(extra_meta={'sfreq': int(sfreq), 'duration': int(duration)})
 
 
 def main() -> None:
@@ -125,8 +129,9 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         synthesise_dataset(tmp, num_cases=32, sfreq=sfreq, duration=duration, rng=rng)
-        paths = find_ssl_npz_paths(tmp)
-        ds = HeteroVitalDBDataset(paths, eager=True, normalize=True)
+        ds = HeteroVitalDBDataset(tmp, eager=True, normalize=True)
+        print(f'[smoke] shards={ds.num_shards}  segments={len(ds)}  '
+              f'cases={ds.num_cases}')
         sampler = BucketBatchSampler(
             ds.segment_bitmap_keys, batch_size=8,
             sampling='uniform', min_bucket_size=8, seed=0,

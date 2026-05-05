@@ -29,8 +29,9 @@ data_scaler: false
 class_downsampling: true
 
 # DataLoader behaviour.
-dataloader_eager: false      # set true if all SSL npz files comfortably fit in RAM
+dataloader_eager: false      # set true if all SSL shards comfortably fit in RAM
 dataloader_normalize: true
+shard_cache_size: 4          # number of shards held in lazy LRU cache per worker
 
 # Bucket-aware sampler.
 bucket_sampling: 'natural'   # 'natural' (proportional to bucket size) or 'uniform'
