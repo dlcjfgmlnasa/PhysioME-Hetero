@@ -211,3 +211,10 @@ __marimo__/
 .claude/
 references/
 img.png
+
+# Obsidian vault: keep config (app/appearance/hotkeys/community-plugins list/snippets)
+# but ignore reinstallable plugin code, downloadable themes, and per-window state.
+**/.obsidian/plugins/
+**/.obsidian/themes/
+**/.obsidian/workspace.json
+**/.obsidian/workspaces.json
