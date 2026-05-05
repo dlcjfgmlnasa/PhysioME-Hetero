@@ -1,28 +1,41 @@
 # -*- coding:utf-8 -*-
+"""Phase-1 NeuroNet (TF-C) pretraining — single modality at a time.
+
+Reads the sharded SSL output written by ``dataset/data_parser/vital_db_ssl.py``,
+filtered to a single modality (``ch_idx`` selects which one). Trains the
+unimodal NeuroNet TF-C objective (recon + L_T + L_F + L_TF) and saves the
+best-loss checkpoint.
+
+Compared to the previous lookahead-coupled per-case loader, this version:
+  * Uses ALL valid SSL segments (no IOH-label filter).
+  * Reads the shard layout once via manifest -> O(1) init even on slow NFS.
+  * Drops the KNN linear-probe validation (no labels in SSL data); selects
+    the best epoch by held-out total TF-C loss instead. Phase-2 hetero +
+    downstream IOH probe remain the authoritative quality signal.
+"""
 import os
 import sys
 sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
 
-import mne
-import torch
-import yaml
+import argparse
 import random
 import shutil
-import argparse
 import warnings
+
+import mne
 import numpy as np
+import torch
 import torch.optim as opt
-from models.utils import model_size
-from sklearn.neighbors import KNeighborsClassifier
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import accuracy_score, f1_score
+import yaml
 from torch.utils.data import DataLoader
-from dataset.utils import group_cross_validation
-from pretrained.dp_neuronet.data_loader import TorchDataset
+from torch.utils.tensorboard import SummaryWriter
+
 from models.dp_neuronet.model import NeuroNet
-# DataAugmentationNeuroNet (sleep-EEG style segment crop / permutation) is no
-# longer used — TF-C generates its two views internally via random masking on
-# the time and frequency domains.
+from models.utils import model_size
+from pretrained.dp_neuronet.hetero_data_loader import (
+    ShardSingleModalDataset,
+    split_shards,
+)
 
 
 warnings.filterwarnings(action='ignore')
@@ -56,8 +69,11 @@ def load_config(path):
 class Trainer(object):
     def __init__(self, args):
         self.args = args
+        self.modal_name = args.ch_names[args.ch_idx]
+
         self.model = NeuroNet(
-            fs=args.rfreq, second=args.second, time_window=args.time_window, time_step=args.time_step,
+            fs=args.rfreq, second=args.second,
+            time_window=args.time_window, time_step=args.time_step,
             encoder_embed_dim=args.encoder_embed_dim, encoder_heads=args.encoder_heads,
             encoder_depths=args.encoder_depths,
             decoder_embed_dim=args.decoder_embed_dim, decoder_heads=args.decoder_heads,
@@ -68,40 +84,62 @@ class Trainer(object):
         self.eff_batch_size = self.args.train_batch_size * self.args.train_batch_accumulation
         self.lr = self.args.train_base_learning_rate * self.eff_batch_size / 256
         self.optimizer = opt.AdamW(self.model.parameters(), lr=self.lr)
-        self.train_paths, self.val_paths, self.eval_paths = self.data_paths()
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.args.train_epochs)
-        self.tensorboard_path = os.path.join(self.args.ckpt_path, self.args.model_name,
-                                             self.args.ch_names[self.args.ch_idx], 'tensorboard')
 
-        # remote tensorboard files
+        # Shard split (deterministic, contiguous trailing slices for val/eval).
+        from pretrained.dp_neuronet.hetero_data_loader import _read_manifest
+        manifest = _read_manifest(self.args.ssl_data_dir)
+        self.num_shards = len(manifest['shards'])
+        self.train_shards, self.val_shards, self.eval_shards = split_shards(
+            num_shards=self.num_shards,
+            val_ratio=getattr(self.args, 'val_shard_ratio', 0.1),
+            eval_ratio=getattr(self.args, 'eval_shard_ratio', 0.1),
+        )
+
+        self.tensorboard_path = os.path.join(self.args.ckpt_path, self.args.model_name,
+                                             self.modal_name, 'tensorboard')
         if os.path.exists(self.tensorboard_path):
             shutil.rmtree(self.tensorboard_path)
-
         self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
 
         print('[NeuroNet Parameter]')
         print('   >> Model Size : {0:.2f}MB'.format(model_size(self.model)))
-        print('   >> Modal Name : {0}'.format(self.args.ch_names[self.args.ch_idx]))
+        print('   >> Modal Name : {0}'.format(self.modal_name))
         print('   >> Frame Size : {0}'.format(self.model.num_patches))
-        print('   >> Leaning Rate : {0}\n'.format(self.lr))
+        print('   >> Learning Rate : {0}'.format(self.lr))
+        print('   >> Shards : {0} total -> train {1} / val {2} / eval {3}'.format(
+            self.num_shards, len(self.train_shards),
+            len(self.val_shards), len(self.eval_shards),
+        ))
+
+    def _build_loader(self, shard_indices, shuffle: bool, drop_last: bool) -> DataLoader:
+        dataset = ShardSingleModalDataset(
+            data_dir=self.args.ssl_data_dir,
+            ch_idx=self.args.ch_idx,
+            shard_indices=shard_indices,
+            normalize=getattr(self.args, 'dataloader_normalize', True),
+            shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=self.args.train_batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_workers=getattr(self.args, 'num_workers', 0),
+            pin_memory=torch.cuda.is_available(),
+        )
+        return loader
 
     def train(self):
-        train_dataset = TorchDataset(paths=self.train_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-                                     ch_idx=self.args.ch_idx,
-                                     scaler=self.args.data_scaler)
-        train_dataloader = DataLoader(train_dataset, batch_size=self.args.train_batch_size, shuffle=True)
-        val_dataset = TorchDataset(paths=self.val_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-                                   ch_idx=self.args.ch_idx,
-                                   scaler=self.args.data_scaler,
-                                   downsampling=self.args.class_downsampling)
-        val_dataloader = DataLoader(val_dataset, batch_size=self.args.train_batch_size, drop_last=True)
-        eval_dataset = TorchDataset(paths=self.eval_paths, sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-                                    ch_idx=self.args.ch_idx,
-                                    scaler=self.args.data_scaler)
-        eval_dataloader = DataLoader(eval_dataset, batch_size=self.args.train_batch_size, drop_last=True)
+        train_dataloader = self._build_loader(self.train_shards, shuffle=True, drop_last=True)
+        val_dataloader = self._build_loader(self.val_shards, shuffle=False, drop_last=False)
+
+        print('   >> Train segments : {0}'.format(len(train_dataloader.dataset)))
+        print('   >> Val   segments : {0}\n'.format(len(val_dataloader.dataset)))
 
         total_step = 0
-        best_model_state, best_score = self.model.state_dict(), 0
+        best_model_state, best_val_loss = self.model.state_dict(), float('inf')
+
         for epoch in range(self.args.train_epochs):
             step = 0
             self.model.train()
@@ -135,79 +173,65 @@ class Trainer(object):
                 step += 1
                 total_step += 1
 
-            val_acc, val_mf1 = self.linear_probing(val_dataloader, eval_dataloader)
+            # Validation: held-out TF-C loss (unsupervised — no labels).
+            val_loss, val_recon = self.evaluate(val_dataloader)
 
-            if val_acc > best_score:
-                best_model_state = self.model.state_dict()
-                best_score = val_acc
+            if val_loss < best_val_loss:
+                best_model_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                best_val_loss = val_loss
 
-            print('[Epoch] : {0:03d} \t [Accuracy] : {1:2.4f} \t [Macro-F1] : {2:2.4f} \n'.format(
-                epoch, val_acc * 100, val_mf1 * 100))
-            self.tensorboard_writer.add_scalar('Validation Accuracy', val_acc, total_step)
-            self.tensorboard_writer.add_scalar('Validation Macro-F1', val_mf1, total_step)
+            print('[Epoch] : {0:03d} \t [Val Total] : {1:.4f} \t [Val Recon] : {2:.4f}\n'.format(
+                epoch, val_loss, val_recon))
+            self.tensorboard_writer.add_scalar('Val Total Loss', val_loss, total_step)
+            self.tensorboard_writer.add_scalar('Val Recon Loss', val_recon, total_step)
 
-            self.optimizer.step()
             self.scheduler.step()
 
         self.save_ckpt(model_state=best_model_state)
 
-    def linear_probing(self, val_dataloader, eval_dataloader):
+    @torch.no_grad()
+    def evaluate(self, dataloader: DataLoader):
         self.model.eval()
-        (train_x, train_y), (test_x, test_y) = self.get_latent_vector(val_dataloader), \
-                                               self.get_latent_vector(eval_dataloader)
-        model = KNeighborsClassifier()
-        model.fit(train_x, train_y)
-        out = model.predict(test_x)
-        acc, mf1 = accuracy_score(test_y, out), f1_score(test_y, out, average='macro')
+        total_loss, total_recon, n = 0.0, 0.0, 0
+        for x, _ in dataloader:
+            x = x.to(device)
+            recon_loss, l_t, l_f, l_tf = self.model(x, mask_ratio=self.args.mask_ratio)
+            bsz = x.shape[0]
+            total_loss += float(recon_loss + l_t + l_f + l_tf) * bsz
+            total_recon += float(recon_loss) * bsz
+            n += bsz
         self.model.train()
-        return acc, mf1
-
-    def get_latent_vector(self, dataloader):
-        total_x, total_y = [], []
-        with torch.no_grad():
-            for data in dataloader:
-                x, y = data
-                x, y = x.to(device), y.to(device)
-                latent = self.model.forward_latent(x)
-                total_x.append(latent.detach().cpu().numpy())
-                total_y.append(y.detach().cpu().numpy())
-        total_x, total_y = np.concatenate(total_x, axis=0), np.concatenate(total_y, axis=0)
-        return total_x, total_y
+        if n == 0:
+            return float('nan'), float('nan')
+        return total_loss / n, total_recon / n
 
     def save_ckpt(self, model_state):
-        modal_name = self.args.ch_names[self.args.ch_idx]
-        ckpt_path = os.path.join(self.args.ckpt_path, self.args.model_name, modal_name, 'model')
-        if not os.path.exists(ckpt_path):
-            os.makedirs(ckpt_path)
-
+        ckpt_path = os.path.join(self.args.ckpt_path, self.args.model_name,
+                                 self.modal_name, 'model')
+        os.makedirs(ckpt_path, exist_ok=True)
         torch.save({
             'model_name': 'DP-NeuroNet',
             'model_state': model_state,
             'model_parameter': {
                 'fs': self.args.rfreq, 'second': self.args.second,
                 'time_window': self.args.time_window, 'time_step': self.args.time_step,
-                'encoder_embed_dim': self.args.encoder_embed_dim, 'encoder_heads': self.args.encoder_heads,
+                'encoder_embed_dim': self.args.encoder_embed_dim,
+                'encoder_heads': self.args.encoder_heads,
                 'encoder_depths': self.args.encoder_depths,
-                'decoder_embed_dim': self.args.decoder_embed_dim, 'decoder_heads': self.args.decoder_heads,
+                'decoder_embed_dim': self.args.decoder_embed_dim,
+                'decoder_heads': self.args.decoder_heads,
                 'decoder_depths': self.args.decoder_depths,
-                'projection_hidden': self.args.projection_hidden, 'temperature': self.args.temperature
+                'projection_hidden': self.args.projection_hidden,
+                'temperature': self.args.temperature,
             },
             'hyperparameter': self.args.__dict__,
-            'paths': {'train_paths': self.train_paths, 'val_paths': self.val_paths, 'eval_paths': self.eval_paths}
+            'shards': {
+                'train_shards': self.train_shards,
+                'val_shards': self.val_shards,
+                'eval_shards': self.eval_shards,
+                'num_shards': self.num_shards,
+            },
         }, os.path.join(ckpt_path, 'best_model.pth'))
-
-    def data_paths(self):
-        paths = group_cross_validation(base_path=self.args.base_path,
-                                       test_size=self.args.test_size,
-                                       holdout_subject_size=self.args.holdout_subject_size)
-        train_paths, val_paths, eval_paths = paths['train_paths'], paths['val_paths'], paths['eval_paths']
-        return train_paths, val_paths, eval_paths
-
-    @staticmethod
-    def compute_metrics(output, target):
-        output = output.argmax(dim=-1)
-        accuracy = torch.mean(torch.eq(target, output).to(torch.float32))
-        return accuracy
 
 
 if __name__ == '__main__':
@@ -215,4 +239,3 @@ if __name__ == '__main__':
     augments = load_config(path=augments.config_yaml)
     trainer = Trainer(augments)
     trainer.train()
-

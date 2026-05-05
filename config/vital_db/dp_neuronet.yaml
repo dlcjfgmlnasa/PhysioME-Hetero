@@ -1,6 +1,8 @@
-base_path: '../../data/vitaldb'
-holdout_subject_size: 100
-test_size: 0.20
+# Phase-1 NeuroNet (TF-C) pretraining — single modality at a time.
+# Reads sharded SSL data produced by dataset/data_parser/vital_db_ssl.py.
+
+ssl_data_dir: '../../data/vitaldb_ssl'
+
 ch_names:
   - 'ABP'
   - 'ECG'
@@ -9,11 +11,22 @@ ch_names:
 # which channel index (0=ABP, 1=ECG, 2=PPG, 3=CVP) this run trains —
 # override on the command line per modality.
 ch_idx: 2
+
 sfreq: 100
 rfreq: 100
 data_scaler: false
 class_downsampling: true
 data_augmentation_prob: 0.90
+
+# DataLoader (sharded reader).
+dataloader_normalize: true
+shard_cache_size: 4
+num_workers: 4
+
+# Shard-level split (parser writes shards in case-arrival order ->
+# contiguous slices are approximately subject-disjoint).
+val_shard_ratio: 0.1
+eval_shard_ratio: 0.1
 
 train_epochs: 30
 train_warmup_epoch: 1
