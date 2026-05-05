@@ -57,13 +57,21 @@ def get_args():
     parser.add_argument('--config_yaml',
                         type=str,
                         default=os.path.join('..', '..', 'config', 'vital_db', 'dp_neuronet.yaml'))
+    parser.add_argument('--ch_idx', type=int, default=None,
+                        help='override ch_idx from yaml (0=ABP, 1=ECG, 2=PPG, 3=CVP)')
+    parser.add_argument('--ckpt_path', type=str, default=None,
+                        help='override ckpt_path from yaml')
     return parser.parse_args()
 
 
-def load_config(path):
-    with open(path, 'r') as f:
+def load_config(path, overrides=None):
+    with open(path, 'r', encoding='utf-8') as f:
         config_dict = yaml.safe_load(f)
-        return argparse.Namespace(**config_dict)
+    if overrides:
+        for k, v in overrides.items():
+            if v is not None:
+                config_dict[k] = v
+    return argparse.Namespace(**config_dict)
 
 
 class Trainer(object):
@@ -235,7 +243,9 @@ class Trainer(object):
 
 
 if __name__ == '__main__':
-    augments = get_args()
-    augments = load_config(path=augments.config_yaml)
+    cli = get_args()
+    augments = load_config(path=cli.config_yaml,
+                           overrides={'ch_idx': cli.ch_idx,
+                                      'ckpt_path': cli.ckpt_path})
     trainer = Trainer(augments)
     trainer.train()
