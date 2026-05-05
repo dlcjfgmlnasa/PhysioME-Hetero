@@ -28,7 +28,7 @@ updated: 2026-05-05
 
 ### "왜 이런 모델이 나왔는지 알고 싶다" — 설계 결정 narrative
 
-[[02_Architecture/Decision_Hetero_Bucket]] → [[02_Architecture/Decision_Presence_Embedding]] → [[02_Architecture/Decision_BFM_Transformer_Port]] → [[02_Architecture/Decision_TFC_over_SimCLR]] → [[02_Architecture/Decision_HandRolled_LoRA]] → [[02_Architecture/Decision_FreqProj_Linear]]
+[[02_Architecture/Decision_Hetero_Bucket]] → [[02_Architecture/Decision_Presence_Embedding]] → [[02_Architecture/Decision_BFM_Transformer_Port]] → [[02_Architecture/Decision_TFC_over_SimCLR]] → [[02_Architecture/Decision_HandRolled_LoRA]] → [[02_Architecture/Decision_FreqProj_Linear]] → [[02_Architecture/Decision_Probe_Refactor]]
 
 ### "Phase 1 학습을 돌리고 싶다"
 
@@ -79,7 +79,7 @@ updated: 2026-05-05
 |---|---|---|
 | 데이터셋 | **VitalDB only** + MIMIC-III WDB transfer 1회 | [[01_Overview/Master_Plan]] |
 | 타깃 venue | **IEEE JBHI** (1순위) / npj Digital Medicine / ICLR 2027 | [[90_Paper/PhysioME-Hetero/09. JBHI 체크리스트]] |
-| 모달리티 | ABP / ECG / PPG @ 100 Hz, 60 s windows | [[01_Overview/Master_Plan]] |
+| 모달리티 | ABP / ECG / PPG @ 100 Hz, 60 s windows. **Step 2: +CO2 (4 modal)**, Step 3 conditional: +CVP (5 modal) | [[01_Overview/Master_Plan]] |
 | Backbone | BFM-derived TransformerEncoder (RMSNorm + GQA + GLU FFN + RoPE) | [[02_Architecture/Decision_BFM_Transformer_Port]] |
 | Phase-1 SSL | NeuroNet + **TF-C** (L_T + L_F + L_TF + recon) | [[02_Architecture/Decision_TFC_over_SimCLR]] |
 | Phase-2 SSL | PhysioME hetero-bucket + availability-aware loss + 3-state presence | [[02_Architecture/Decision_Hetero_Bucket]] |
@@ -96,6 +96,9 @@ updated: 2026-05-05
 - ✅ PhysioME RoPE-everywhere (Task 23)
 - ✅ peft → 자체 LoRA (Task 24)
 - ✅ Freq view zero-pad → learned linear lift (`freq_proj`)
+- ✅ **Step 1**: linear_probing SVC → LR + sampled subsets (`probe_utils`) — modality 확장 선결조건
+- ⏳ **Step 2**: CO2 modality 추가 → 4 modal / 15 bucket
+- ⏳ **Step 3** (conditional): CVP modality 추가 → 5 modal / 31 bucket. CVP 분포 확인 후 결정
 - ⏳ Task 8 — VitalDB pretraining 본격 run (사용자 GPU)
 - ⏳ Tasks 9–13 — downstream 평가 + ablation + transfer + paper draft
 

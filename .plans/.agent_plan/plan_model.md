@@ -107,6 +107,7 @@ models/
 - [x] **[High]** peft → 자체 LoRA (`models/transformer/lora.py`) 교체
 - [x] **[High]** Downstream model wrapper (`PhysioMEClassifier`) 작성
 - [x] **[Medium]** Smoke test (`experiments/smoke_test_hetero.py`) 통과 — 7 bucket, presence-state, gradient flow 검증
+- [x] **[High]** Linear-probe refactor (`pretrained/physiome/probe_utils.py`) — SVC → LR + 모달 부분집합 샘플링 (Step 1, N≥4 확장 선결조건)
 
 ### 진행 예정 (`[ ]`)
 
@@ -141,6 +142,21 @@ models/
 - [ ] **[Low]** **MoE / multi-resolution patch 검토 (out of scope, 보류)**
   - BFM에는 있지만 PhysioME에는 미포팅. 첫 paper에는 안 넣기로 결정.
   - 참고: 향후 follow-up에서 고려.
+
+### Modality 확장 (Step 2 / Step 3 — Master_Plan과 연동)
+
+- [ ] **[High]** **Step 2 — CO2 modality 추가 (4 modal, 15 bucket)**
+  - 입력: VitalDB raw (CO2/etCO2 채널), 기존 ABP/ECG/PPG 파이프라인
+  - 출력: 4-modal Phase-1 ckpt 4개 + Phase-2 hetero ckpt
+  - 의존성: data-engineer의 vital_db_ssl.py CO2 확장 완료, Phase-1 trainer가 CO2 modality argument 받기
+  - 참고: 변경 위치: `pretrained/physiome/hetero_data_loader.py::MODAL_ORDER`, `models/physiome/model.py` (새 modality 추가 시 backbone dict 자동 반영), config 4종 (`dp_neuronet.yaml`, `physiome_hetero.yaml`, `physiome_hetero_a3.yaml`, A1용 `physiome.yaml`).
+
+- [ ] **[Medium / Conditional]** **Step 3 — CVP modality 추가 (5 modal, 31 bucket)**
+  - **선결조건**: Step 2의 SSL bucket 분포 통계에서 CVP coverage ≥20%이고 자연 분포가 한두 bucket에 압도적으로 쏠리지 않을 것.
+  - 입력: CO2 단계 산출물 + VitalDB CVP 채널
+  - 출력: 5-modal Phase-1 ckpt 5개 + Phase-2 hetero ckpt
+  - 의존성: Step 2 완료. **Master_Plan 의 Venue 결정도 npj 로 갱신** 필수.
+  - 참고: bucket 31개 운영 시 `BucketBatchSampler.min_bucket_size` 조정 필요할 수 있음 (long-tail bucket 대비 oversampling factor JSON).
 
 ---
 

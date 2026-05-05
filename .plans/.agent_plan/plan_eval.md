@@ -88,6 +88,7 @@
 ### 완료 (`[x]`)
 - [x] **[High]** Downstream evaluator 인프라 (`run_ioh`, `run_aki`, `run_mortality`, `run_ablation_a2`, `calibration`)
 - [x] **[High]** Smoke test 통과 (7-subset inference 검증)
+- [x] **[High]** Linear-probe refactor (SVC → LR + sampled subsets, `pretrained/physiome/probe_utils.py`) — N≥4 modal 확장 선결조건 (Step 1)
 
 ### 진행 예정 (`[ ]`)
 

@@ -8,16 +8,18 @@ locked_until: paper-submission
 
 > 변경 시 이 파일을 **먼저** 갱신하고, 이후 다른 wiki/code/plan 파일을 동기화한다. 직접 변경 없이 코드만 바꾸지 말 것.
 
-## 데이터 결정 (locked)
+## 데이터 결정 (locked, with phased modality expansion)
 
 | 항목 | 결정 | 이유 |
 |---|---|---|
 | 사전학습 데이터 | **VitalDB only** | SNU Vital Lab 홈, IOH narrative 강함, modality synergy 임상적으로 명료 |
-| 모달리티 | **ABP / ECG / PPG** (3종) | VitalDB에서 함께 측정 가능, 생리적 상관 명확 |
+| 모달리티 — 시작 | **ABP / ECG / PPG** (3종, 7 bucket) | JBHI 1-pass 안전선 |
+| 모달리티 — Step 2 | **+CO2** (4종, 15 bucket) | 호흡 ↔ 산소화 ↔ IOH/AKI mechanistic linkage. 여전히 JBHI scope |
+| 모달리티 — Step 3 (조건부) | **+CVP** (5종, 31 bucket) | 정맥계 → preload → IOH 인과. **Step 2 bucket 분포 결과에 따라 진행 여부 결정** (CVP coverage ≥20% / non-degenerate spread). Venue 변경 트리거 |
 | 샘플레이트 | 100 Hz | 원본 PhysioME 합치 |
 | Window | 60 s | 원본 PhysioME 합치 |
-| 외부 transfer | MIMIC-III Waveform DB (1회) | "단일 dataset" reviewer concern 대응 |
-| **off-table** | Sleep-EDFx, MASS, SHHS, MESA, EEG | 2026-05-04 명시적 제거 |
+| 외부 transfer | MIMIC-III Waveform DB (1회) | "단일 dataset" reviewer concern 대응. transfer는 ABP/ECG/PPG 3종으로만 (MIMIC WDB 한계) |
+| **off-table** | Sleep-EDFx, MASS, SHHS, MESA, **EEG** | 2026-05-04 / 2026-05-05 명시. EEG는 cortical activity → hemodynamic SSL과 결이 다름, 별도 EEG-FM (LaBraM 등) 직접 비교 필요해 paper scope 폭발 |
 
 ## 모델 결정 (locked)
 
@@ -37,16 +39,19 @@ locked_until: paper-submission
 | Primary downstream | IOH (MAP<65 sustained ≥1min, 5min horizon) |
 | Secondary | AKI (KDIGO), Mortality (MIMIC-III) |
 | Ablations | A1 (synth-only baseline) / **A2 (real vs synth missing — 핵심)** / A3 (restoration toggle) |
-| Subset 평가 | 7개 모달 부분집합 모두 (1~3개) |
+| Subset 평가 | N≤3: 모든 부분집합 (7개). N≥4: full + each single + 무작위 추출로 최대 10개 (`select_probe_subsets`) |
 | Calibration | ECE + reliability diagram (IOH primary) |
 | Seed | 최소 3개 (mean ± std) |
 | Split | Subject/case-level (leakage 방지) |
 
-## Venue 결정
+## Venue 결정 (modality 확장과 연동)
 
-1. **IEEE JBHI** (1순위) — IF ~7.7, rolling submission
-2. **npj Digital Medicine** (대안) — methodology 강하면
-3. **ICLR 2027** (stretch) — A2 gap이 dramatic할 경우
+| 모달 수 | Primary venue | 이유 |
+|---|---|---|
+| 3 modal (Step 1 그대로 멈춤) | **IEEE JBHI** | "missing-modality robustness for hemodynamic SSL" 깔끔한 scope |
+| 4 modal (Step 2 도달) | **IEEE JBHI** (여전히) | CO2 추가는 mechanistic narrative 강화일 뿐 scope 확장 아님 |
+| 5 modal (Step 3 도달) | **npj Digital Medicine** | "perioperative monitoring foundation model" 색채 강화. JBHI는 narrow한 single-task paper 선호 |
+| 5 modal + dramatic A2 gap | **ICLR 2027** | 분포-shift 정조준 paper로 framing 가능 |
 
 ## 진행 시퀀스 (변경 금지)
 
@@ -86,3 +91,5 @@ JBHI draft
 | 2026-05-04 | SimCLR → TF-C | false-negative 해결, biosignal natural |
 | 2026-05-05 | peft → 자체 LoRA | 의존성 제거, state-dict 정합성 |
 | 2026-05-05 | Freq view zero-pad → freq_proj | structural-zero artifact 제거 |
+| 2026-05-05 | Modality 확장 phased plan 추가 (3→4→5) | impact 키우기 + venue 단계적 상향. Step 3은 conditional |
+| 2026-05-05 | linear_probing: SVC → LR + sampled subsets (`probe_utils`) | 4+ modal에서 2^N − 1 SVC 폭발 방지 (Step 1 선결조건) |

@@ -123,6 +123,26 @@ case_id, segment_id, sampling_rate, window_sec
 - [ ] **[Low]** **vital_db.py (legacy) 제거 또는 archive**
   - 현재 vital_db_ssl.py + vital_db_downstream.py로 대체됨. legacy import 사용처 확인 후 제거.
 
+### Modality 확장 (Step 2 / Step 3 — Master_Plan과 연동)
+
+- [ ] **[High]** **Step 2 — vital_db_ssl.py 에 CO2 (capnography / etCO2) 추가**
+  - 입력: VitalDB raw `.vital`, 기존 quality_check / signal_filter 헬퍼
+  - 출력: hetero npz 스키마에 4번째 채널 + 4-bit mask (`(n_seg, 4)`)
+  - 의존성: `_signal_filters.SIGNAL_CONFIGS` 의 CO2 항목 검증 (cutoff/notch). `_quality_checks` 에 이미 CO2 지원 있음.
+  - 참고: CO2 sample rate 가 native로 낮을 수 있음 → `resample_to_target` 로 100Hz 통일.
+
+- [ ] **[High]** **Step 2 — bucket 분포 통계 측정 + 보고**
+  - 입력: 4-modal SSL npz manifest
+  - 출력: `data/vital_db_ssl/bucket_stats.json` (15 bucket별 case 수 + segment 수, CVP coverage 포함)
+  - 의존성: 위 항목 완료
+  - 참고: **이 통계로 Step 3 진행 여부 결정**. CVP coverage ≥20% 와 자연 분포 spread 확인.
+
+- [ ] **[Medium / Conditional]** **Step 3 — vital_db_ssl.py 에 CVP 추가**
+  - 위 bucket 분포 결과 OK 시에만 진행
+  - 출력: 5-modal hetero npz (`(n_seg, 5)` mask)
+  - 의존성: Step 2 통계 검토
+  - 참고: CVP는 invasive (CV catheter) → 자연스럽게 sparse modality. naturally-absent bucket이 paper의 main claim 데이터.
+
 ---
 
 ## 6. Quality Standards

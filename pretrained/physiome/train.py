@@ -11,17 +11,14 @@ import random
 import warnings
 import argparse
 import numpy as np
-from itertools import combinations
 import torch.optim as opt
-from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, f1_score
-from collections import OrderedDict
 from models.utils import model_size
 from dataset.utils import group_cross_validation
 from torch.utils.tensorboard import SummaryWriter
 from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
 from models.physiome.model import PhysioME
 from pretrained.physiome.data_loader import TorchDataset
+from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
 from torch.utils.data import DataLoader
 from models.transformer import apply_lora
 
@@ -154,26 +151,21 @@ class Trainer(object):
         self.save_ckpt(best_multimodal_model_state)
 
     def linear_probing(self, epoch, val_dataloader, eval_dataloader):
+        """LR probe over a sampled set of modality subsets (see probe_utils)."""
         self.model.eval()
-        modal_combinations = []
-        for r in range(1, len(self.ch_names) + 1):
-            modal_combinations.extend(combinations(self.ch_names, r))
+        max_subsets = int(getattr(self.args, 'probe_max_subsets', 10))
+        subsets = select_probe_subsets(
+            self.ch_names, max_subsets=max_subsets, seed=epoch,
+        )
 
-        acc_list, mf1_list = [], []
-        for modal_combination in modal_combinations:
-            (train_x, train_y), (test_x, test_y) = self.get_latent_vector(modal_combination, val_dataloader), \
-                                                   self.get_latent_vector(modal_combination, eval_dataloader)
-            model = SVC()
-            model.fit(train_x, train_y)
-            pred_y = model.predict(test_x)
-            acc, mf1 = accuracy_score(test_y, pred_y), f1_score(test_y, pred_y, average='macro')
-            acc_list.append(acc)
-            mf1_list.append(mf1)
-            print('[Epoch] : {0:03d} \t [{1}] => Accuracy : {2:2.4f} \t Macro-F1 : {3:2.4f}'.format(
-                    epoch, ','.join(modal_combination), acc * 100, mf1 * 100))
-
+        train_fn = lambda subset: self.get_latent_vector(subset, val_dataloader)
+        eval_fn = lambda subset: self.get_latent_vector(subset, eval_dataloader)
+        mean_acc, mean_mf1, _ = run_probe(
+            subsets, train_fn, eval_fn,
+            log_prefix=f'[Epoch {epoch:03d}]',
+        )
         self.model.train()
-        return np.mean(acc_list), np.mean(mf1_list)
+        return mean_acc, mean_mf1
 
     def get_latent_vector(self, modal_combination, dataloader):
         self.model.eval()

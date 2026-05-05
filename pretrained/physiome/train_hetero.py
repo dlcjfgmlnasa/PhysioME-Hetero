@@ -28,7 +28,6 @@ import random
 import shutil
 import warnings
 from collections import OrderedDict
-from itertools import combinations
 from typing import Dict, List, Tuple
 
 import mne
@@ -38,8 +37,6 @@ import torch.nn as nn
 import torch.optim as opt
 import yaml
 from models.transformer import apply_lora
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.svm import SVC
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -55,6 +52,7 @@ from pretrained.physiome.hetero_data_loader import (
     find_ssl_npz_paths,
     hetero_collate_fn,
 )
+from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
 
 
 warnings.filterwarnings(action='ignore')
@@ -290,31 +288,33 @@ class HeteroTrainer:
         self.save_ckpt(best_state)
 
     # ------------------------------------------------------------------
-    # Validation: linear probing across modal subsets (matches train.py)
+    # Validation: linear probing across modal subsets
     # ------------------------------------------------------------------
     def linear_probing(self, epoch: int, val_dataloader: DataLoader,
                        eval_dataloader: DataLoader) -> Tuple[float, float]:
+        """Probe the frozen encoder via Logistic Regression on a sampled
+        subset of the ``2^N - 1`` modality combinations.
+
+        See ``probe_utils`` for the sampling rule (always include the full
+        set + every single-modal subset, then random-sample up to
+        ``probe_max_subsets``). This keeps probe runtime bounded even at
+        N=4/5 while preserving the corner-case coverage that matters for
+        hetero ablations.
+        """
         self.model.eval()
-        modal_combinations = []
-        for r in range(1, len(self.ch_names) + 1):
-            modal_combinations.extend(combinations(self.ch_names, r))
+        max_subsets = int(getattr(self.args, 'probe_max_subsets', 10))
+        subsets = select_probe_subsets(
+            self.ch_names, max_subsets=max_subsets, seed=epoch,
+        )
 
-        acc_list, mf1_list = [], []
-        for modal_combination in modal_combinations:
-            (train_x, train_y) = self._latent_vector(modal_combination, val_dataloader)
-            (test_x, test_y) = self._latent_vector(modal_combination, eval_dataloader)
-            clf = SVC()
-            clf.fit(train_x, train_y)
-            pred_y = clf.predict(test_x)
-            acc = accuracy_score(test_y, pred_y)
-            mf1 = f1_score(test_y, pred_y, average='macro')
-            acc_list.append(acc)
-            mf1_list.append(mf1)
-            print(f'[Epoch] : {epoch:03d} \t [{",".join(modal_combination)}] '
-                  f'=> Acc {acc * 100:2.4f}  Macro-F1 {mf1 * 100:2.4f}')
-
+        train_fn = lambda subset: self._latent_vector(subset, val_dataloader)
+        eval_fn = lambda subset: self._latent_vector(subset, eval_dataloader)
+        mean_acc, mean_mf1, _ = run_probe(
+            subsets, train_fn, eval_fn,
+            log_prefix=f'[Epoch {epoch:03d}]',
+        )
         self.model.train()
-        return float(np.mean(acc_list)), float(np.mean(mf1_list))
+        return mean_acc, mean_mf1
 
     def _latent_vector(self, modal_combination: Tuple[str, ...],
                        dataloader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:

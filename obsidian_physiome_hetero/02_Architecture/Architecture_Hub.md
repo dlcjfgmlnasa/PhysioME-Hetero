@@ -47,6 +47,7 @@ Downstream
 5. [[Decision_TFC_over_SimCLR]] — Phase-1을 SimCLR에서 Time-Frequency Consistency로 교체
 6. [[Decision_FreqProj_Linear]] — TF-C freq view의 zero-padding hack을 학습된 linear lift으로 교체
 7. [[Decision_HandRolled_LoRA]] — peft 의존성 제거, `models/transformer/lora.py`로 직접 구현
+8. [[Decision_Probe_Refactor]] — linear_probing SVC → LR + 부분집합 샘플링 (N≥4 modal 확장 선결조건)
 
 ## 컴포넌트 위치 (코드 ↔ wiki)
 
