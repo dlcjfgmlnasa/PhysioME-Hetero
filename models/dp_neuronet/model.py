@@ -2,7 +2,6 @@
 import torch
 import numpy as np
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List
 from models.dp_neuronet.resnet1d import FrameBackBone
 from timm.models.vision_transformer import Block
@@ -100,6 +99,13 @@ class NeuroNet(nn.Module):
         self.projector_time = _build_projector(encoder_embed_dim, projection_hidden)
         self.projector_freq = _build_projector(encoder_embed_dim, projection_hidden)
         self.projector_tfc = _build_projector(encoder_embed_dim, projection_hidden)
+
+        # Learned lift from |FFT| magnitude (W//2+1) up to the time-window length
+        # (W) so ``frame_backbone_freq`` (which is shape-locked to W=fs*time_window)
+        # can ingest the freq view without zero-padding artifacts.
+        window = int(time_window * fs)
+        self.freq_proj = nn.Linear(window // 2 + 1, window)
+
         self.norm_pix_loss = False
 
     # ------------------------------------------------------------------
@@ -110,13 +116,12 @@ class NeuroNet(nn.Module):
         return self.make_frame(x)
 
     def _frames_freq(self, frames_time: torch.Tensor) -> torch.Tensor:
-        """|FFT| magnitude per frame, zero-padded to the time-window length so
-        the same FrameBackBone architecture can ingest both domains."""
+        """|FFT| magnitude per frame, lifted by a learned linear projection
+        from W//2+1 up to W so the frame_backbone_freq architecture (which
+        is shape-locked to W = fs * time_window) can ingest both domains
+        without the structural-zero artifacts of zero-padding."""
         mag = torch.fft.rfft(frames_time, dim=-1).abs()        # (B, F, W//2+1)
-        pad = frames_time.shape[-1] - mag.shape[-1]
-        if pad > 0:
-            mag = F.pad(mag, (0, pad))                          # (B, F, W)
-        return mag
+        return self.freq_proj(mag)                             # (B, F, W)
 
     # ------------------------------------------------------------------
     # Forward (TF-C 3-loss + reconstruction)
@@ -142,11 +147,11 @@ class NeuroNet(nn.Module):
         o_t1, o_t2 = latent_t1[:, 0, :], latent_t2[:, 0, :]
         o_f1, o_f2 = latent_f1[:, 0, :], latent_f2[:, 0, :]
 
-        # 5. L_T: time-domain SimCLR between the two masked views.
+        # 5. L_T: time-domain NT-Xent between the two masked views.
         l_t = self.contrastive_loss(self.projector_time(o_t1),
                                     self.projector_time(o_t2))
 
-        # 6. L_F: frequency-domain SimCLR between the two masked views.
+        # 6. L_F: frequency-domain NT-Xent between the two masked views.
         l_f = self.contrastive_loss(self.projector_freq(o_f1),
                                     self.projector_freq(o_f2))
 
