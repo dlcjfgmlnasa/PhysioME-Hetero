@@ -58,7 +58,7 @@ def test_select_subsets_n5_capped() -> None:
 
 
 def test_select_subsets_n4() -> None:
-    ch = ('ABP', 'ECG', 'PPG', 'CO2')
+    ch = ('ABP', 'ECG', 'PPG', 'CVP')
     subsets = select_probe_subsets(ch, max_subsets=10, seed=0)
     # 2^4 - 1 = 15 > 10 -> capped
     assert len(subsets) == 10

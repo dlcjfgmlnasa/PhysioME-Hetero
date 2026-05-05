@@ -50,9 +50,9 @@ from downstream.tasks.mortality import (
 from downstream.utils import load_pretrained_to_classifier
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-# MIMIC-III WDB Matched Subset only has ABP / ECG / PPG (no CO2/CVP).
+# MIMIC-III WDB Matched Subset only has ABP / ECG / PPG (no CVP/CO2).
 # This stays 3-modal even when the model is trained 4+ modal; the absent
-# CO2 slot is filled with ``dropped_modality_token`` inside
+# CVP slot is filled with ``dropped_modality_token`` inside
 # ``PhysioME.inference_missing_modality`` (same code path as any subset).
 MODAL_ORDER = ('ABP', 'ECG', 'PPG')
 

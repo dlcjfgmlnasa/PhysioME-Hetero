@@ -44,15 +44,19 @@ MODAL_TRACK_NAMES: Dict[str, str] = {
     'ABP': 'SNUADC/ART',
     'ECG': 'SNUADC/ECG_II',
     'PPG': 'SNUADC/PLETH',
-    # Step 2 (2026-05-05): 4-modal expansion — CO2 (capnography / etCO2)
-    'CO2': 'Primus/CO2',
+    # Step 2 (2026-05-05): 4-modal expansion — CVP (central venous pressure).
+    # SNUADC/CVP is the 500Hz raw waveform from the analog port; resampled
+    # to 100 Hz alongside the others. Available only in ~25% of cases (CV
+    # catheter is invasive; major surgery only) — that sparsity is the
+    # paper's main hetero-availability signal.
+    'CVP': 'SNUADC/CVP',
 }
 # short-name → key used by SIGNAL_CONFIGS / domain_quality_check
 MODAL_TO_SIGNAL_KEY: Dict[str, str] = {
     'ABP': 'abp', 'ECG': 'ecg', 'PPG': 'ppg',
-    'CO2': 'co2',
+    'CVP': 'cvp',
 }
-MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CO2']
+MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CVP']
 
 
 def get_args():

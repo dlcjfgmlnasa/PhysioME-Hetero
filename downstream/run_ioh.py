@@ -44,7 +44,7 @@ from downstream.utils import load_pretrained_to_classifier
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-MODAL_ORDER = ('ABP', 'ECG', 'PPG', 'CO2')
+MODAL_ORDER = ('ABP', 'ECG', 'PPG', 'CVP')
 
 
 def get_args():

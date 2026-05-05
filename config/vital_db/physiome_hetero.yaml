@@ -13,12 +13,14 @@ holdout_subject_size: 100
 test_size: 0.20
 
 # Backbone unimodal checkpoints (same as the original physiome.yaml).
-# 4-modal hetero (Step 2, 2026-05-05): CO2 added — bucket count 7 -> 15.
+# 4-modal hetero (Step 2, 2026-05-05): CVP added — bucket count 7 -> 15.
+# CVP is sparse (~25% of cases, CV catheter is invasive / major surgery only),
+# which is the paper's headline hetero-availability signal.
 modality_name2path:
   'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
   'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
   'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
-  'CO2': '../../ckpt/vitaldb/neuronet/CO2/neuronet/model/best_model.pth'
+  'CVP': '../../ckpt/vitaldb/neuronet/CVP/neuronet/model/best_model.pth'
 
 # Signal config.
 sfreq: 100

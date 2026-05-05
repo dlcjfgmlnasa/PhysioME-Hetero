@@ -10,7 +10,7 @@ Output (per case, one ``.npz`` in ``trg_path``):
     abp: float32 [N]   — preprocessed ABP at sfreq Hz, NaN where invalid
     ecg: float32 [N]   — preprocessed ECG, ditto
     ppg: float32 [N]   — preprocessed PPG, ditto
-    co2: float32 [N]   — preprocessed CO2 (capnography / etCO2), ditto
+    cvp: float32 [N]   — preprocessed CVP (central venous pressure), ditto
     modality_present: bool [M]   — which of MODAL_ORDER exist in the recording
     sfreq: int
     case_id: str
