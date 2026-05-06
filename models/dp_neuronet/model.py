@@ -1,6 +1,5 @@
 # -*- coding:utf-8 -*-
 import torch
-import numpy as np
 import torch.nn as nn
 from typing import List
 from models.dp_neuronet.resnet1d import FrameBackBone
@@ -80,6 +79,7 @@ class NeuroNet(nn.Module):
         self.time_window = time_window
         self.time_step = time_step
         self.window_samples = int(time_window * fs)
+        self.frame_step = int(time_step * fs)
 
         self.num_patches, _ = frame_size(fs=fs, second=second, time_window=time_window, time_step=time_step)
         # Time-domain backbone (raw waveform per frame).
@@ -202,17 +202,16 @@ class NeuroNet(nn.Module):
         return loss
 
     def make_frame(self, x):
-        size = self.fs * self.second
-        step = int(self.time_step * self.fs)
-        window = int(self.time_window * self.fs)
-        frame = []
-        for i in range(0, size, step):
-            start_idx, end_idx = i, i+window
-            sample = x[..., start_idx: end_idx]
-            if sample.shape[-1] == window:
-                frame.append(sample)
-        frame = torch.stack(frame, dim=1)
-        return frame
+        """Slice ``[B, T]`` into ``[B, F, W]`` frames via ``Tensor.unfold``.
+
+        Vectorised replacement for the prior Python for-loop + torch.stack
+        implementation. For non-overlap framing (``time_step == time_window``)
+        ``unfold`` returns a contiguous view; ``.contiguous()`` is a no-op there
+        and a single bulk copy in the overlap case.
+        """
+        return x.unfold(
+            dimension=-1, size=self.window_samples, step=self.frame_step,
+        ).contiguous()
 
 
 class MaskedAutoEncoderViT(nn.Module):
@@ -355,11 +354,15 @@ class NeuroNetEncoder(nn.Module):
         self.mlp_ratio = 4.0
         self.fs, self.second = fs, second
         self.time_window, self.time_step = time_window, time_step
+        self.window_samples = int(time_window * fs)
+        self.frame_step = int(time_step * fs)
         self.encoder_embed_dim = encoder_embed_dim
         self.encoder_heads = encoder_heads
         self.encoder_depths = encoder_depths
 
-        _, self.num_patches, self.frame_size = self.make_frame(torch.randn(1, self.fs * self.second)).shape
+        self.num_patches, self.frame_size = frame_size(
+            fs=fs, second=second, time_window=time_window, time_step=time_step,
+        )
         self.grid_h = int(self.num_patches // 1)
         self.grid_w = int(self.encoder_embed_dim // self.encoder_embed_dim)
 
@@ -389,32 +392,28 @@ class NeuroNetEncoder(nn.Module):
         return x
 
     def make_frame(self, x):
-        size = self.fs * self.second
-        step = int(self.time_step * self.fs)
-        window = int(self.time_window * self.fs)
-        frame = []
-        for i in range(0, size, step):
-            start_idx, end_idx = i, i+window
-            sample = x[..., start_idx: end_idx]
-            if sample.shape[-1] == window:
-                frame.append(sample)
-        frame = torch.stack(frame, dim=1)
-        return frame
+        """Slice ``[B, T]`` into ``[B, F, W]`` frames via ``Tensor.unfold``."""
+        return x.unfold(
+            dimension=-1, size=self.window_samples, step=self.frame_step,
+        ).contiguous()
 
 
 def frame_size(fs, second, time_window, time_step):
-    x = np.random.randn(1, fs * second)
+    """Closed-form ``(num_frames, window_samples)`` for the framing parameters.
+
+    Replaces the previous loop + ``np.stack`` shape probe — pure arithmetic,
+    no allocation. ``num_frames`` matches both the prior loop implementation
+    and ``Tensor.unfold(dim=-1, size=window, step=step)``:
+
+        F = floor((size - window) / step) + 1   if size >= window else 0
+    """
     size = fs * second
     step = int(time_step * fs)
     window = int(time_window * fs)
-    frame = []
-    for i in range(0, size, step):
-        start_idx, end_idx = i, i + window
-        sample = x[..., start_idx: end_idx]
-        if sample.shape[-1] == window:
-            frame.append(sample)
-    frame = np.stack(frame, axis=1)
-    return frame.shape[1], frame.shape[2]
+    if size < window:
+        return 0, window
+    num_frames = (size - window) // step + 1
+    return num_frames, window
 
 
 if __name__ == '__main__':
