@@ -252,7 +252,6 @@ def icp_quality_check(segment, sr=100.0, min_hr=30.0, max_hr=200.0,
                                  regularity_threshold,
                                  max_flatline_ratio, min_autocorr)
 
-
 # ── Respiration-based (CO2 / AWP) ────────────────────────────────
 
 

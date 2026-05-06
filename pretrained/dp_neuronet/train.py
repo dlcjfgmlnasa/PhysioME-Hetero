@@ -79,6 +79,8 @@ def get_args():
                              'per modality.')
     parser.add_argument('--eager_workers', type=int, default=None,
                         help='parallel shard readers used by --eager (default 8)')
+    parser.add_argument('--no_amp', action='store_const', const=True, default=None,
+                        help='disable bf16 autocast (default: AMP on for cuda).')
     parser.add_argument('--holdout_subjects_file', type=str, default=None,
                         help='override holdout_subjects_file from yaml '
                              '(JSON written by sample_holdout). Excludes '
@@ -213,6 +215,14 @@ class Trainer(object):
         print('   >> Train segments : {0}'.format(len(train_dataloader.dataset)))
         print('   >> Val   segments : {0}\n'.format(len(val_dataloader.dataset)))
 
+        # bf16 autocast on CUDA (no GradScaler needed: bf16 has FP32 dynamic
+        # range). Cuts step time ~1.5-2x on L40S/Ampere+ vs FP32. Set --no_amp
+        # to fall back to FP32 (e.g. for debugging numerical issues).
+        amp_enabled = (device.type == 'cuda'
+                       and not bool(getattr(self.args, 'no_amp', False)))
+        if amp_enabled:
+            print('   >> AMP     : bf16 autocast')
+
         total_step = 0
         best_model_state, best_val_loss = self.model.state_dict(), float('inf')
 
@@ -228,8 +238,10 @@ class Trainer(object):
 
             for x, _ in train_dataloader:
                 x = x.to(device)
-                recon_loss, l_t, l_f, l_tf = self.model(x, mask_ratio=self.args.mask_ratio)
-                loss = recon_loss + l_t + l_f + l_tf
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
+                                    enabled=amp_enabled):
+                    recon_loss, l_t, l_f, l_tf = self.model(x, mask_ratio=self.args.mask_ratio)
+                    loss = recon_loss + l_t + l_f + l_tf
                 loss.backward()
 
                 if (step + 1) % self.args.train_batch_accumulation == 0:
@@ -326,6 +338,7 @@ if __name__ == '__main__':
                                       'prefetch_factor': cli.prefetch_factor,
                                       'eager': cli.eager,
                                       'eager_workers': cli.eager_workers,
+                                      'no_amp': cli.no_amp,
                                       'holdout_subjects_file': cli.holdout_subjects_file})
     trainer = Trainer(augments)
     trainer.train()
