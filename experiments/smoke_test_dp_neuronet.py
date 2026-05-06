@@ -94,6 +94,22 @@ def main() -> None:
         print(f'[smoke] PPG train segments={len(train_ds)}  '
               f'val segments={len(val_ds)}')
 
+        # Eager mode parity: eager and lazy must produce identical (modulo
+        # normalization) tensors. This is the I/O bypass path used on slow
+        # filesystems.
+        eager_ds = ShardSingleModalDataset(tmp, ch_idx=ch_idx,
+                                           shard_indices=train_sh,
+                                           normalize=True, eager=True,
+                                           eager_workers=2)
+        assert len(eager_ds) == len(train_ds), \
+            f'eager len mismatch: {len(eager_ds)} vs {len(train_ds)}'
+        for i in (0, len(train_ds) // 2, len(train_ds) - 1):
+            x_lazy, _ = train_ds[i]
+            x_eager, _ = eager_ds[i]
+            assert torch.allclose(x_lazy, x_eager, atol=1e-5), \
+                f'eager/lazy mismatch at idx={i}'
+        print(f'[smoke] eager mode parity ok ({len(eager_ds)} segments preloaded)')
+
         # Verify ShardSequentialSampler: each shard's segments must come out
         # contiguously (no inter-shard interleaving).
         sampler = ShardSequentialSampler(train_ds, seed=0, shuffle_shards=True)

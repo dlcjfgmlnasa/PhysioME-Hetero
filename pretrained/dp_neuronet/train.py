@@ -72,6 +72,13 @@ def get_args():
                         help='override shard_cache_size from yaml')
     parser.add_argument('--prefetch_factor', type=int, default=None,
                         help='override DataLoader prefetch_factor from yaml')
+    parser.add_argument('--eager', action='store_const', const=True, default=None,
+                        help='pre-load all (modality, kept-segment) slices into '
+                             'RAM at init (one parallel shard sweep). Eliminates '
+                             'per-batch network I/O at the cost of ~13-20 GB RAM '
+                             'per modality.')
+    parser.add_argument('--eager_workers', type=int, default=None,
+                        help='parallel shard readers used by --eager (default 8)')
     parser.add_argument('--holdout_subjects_file', type=str, default=None,
                         help='override holdout_subjects_file from yaml '
                              '(JSON written by sample_holdout). Excludes '
@@ -144,6 +151,11 @@ class Trainer(object):
         ))
         holdout_path = getattr(self.args, 'holdout_subjects_file', None)
         print('   >> Holdout : {0}'.format(holdout_path or '<none>'))
+        eager = bool(getattr(self.args, 'eager', False))
+        if eager:
+            print('   >> Eager   : True (workers={0})'.format(
+                int(getattr(self.args, 'eager_workers', 8) or 8)
+            ))
 
     def _build_loader(self, shard_indices, shuffle: bool, drop_last: bool) -> DataLoader:
         holdout = load_holdout_case_ids(
@@ -156,6 +168,8 @@ class Trainer(object):
             normalize=getattr(self.args, 'dataloader_normalize', True),
             shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
             exclude_case_ids=holdout,
+            eager=bool(getattr(self.args, 'eager', False)),
+            eager_workers=int(getattr(self.args, 'eager_workers', 8) or 8),
         )
         num_workers = int(getattr(self.args, 'num_workers', 0) or 0)
 
@@ -310,6 +324,8 @@ if __name__ == '__main__':
                                       'num_workers': cli.num_workers,
                                       'shard_cache_size': cli.shard_cache_size,
                                       'prefetch_factor': cli.prefetch_factor,
+                                      'eager': cli.eager,
+                                      'eager_workers': cli.eager_workers,
                                       'holdout_subjects_file': cli.holdout_subjects_file})
     trainer = Trainer(augments)
     trainer.train()

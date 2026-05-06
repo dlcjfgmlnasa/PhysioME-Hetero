@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import json
 import os
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import tqdm
 from torch.utils.data import Dataset, Sampler
 
 
@@ -128,11 +129,14 @@ class ShardSingleModalDataset(Dataset):
     def __init__(self, data_dir: str, ch_idx: int,
                  shard_indices: Optional[Sequence[int]] = None,
                  normalize: bool = True, shard_cache_size: int = 4,
-                 exclude_case_ids: Optional[set] = None):
+                 exclude_case_ids: Optional[set] = None,
+                 eager: bool = False, eager_workers: int = 8):
         self.data_dir = data_dir
         self.ch_idx = int(ch_idx)
         self.normalize = bool(normalize)
         self.shard_cache_size = max(1, int(shard_cache_size))
+        self.eager = bool(eager)
+        self.eager_workers = max(1, int(eager_workers))
 
         manifest = _read_manifest(data_dir)
         self.modal_order: List[str] = list(manifest.get('modal_order', []))
@@ -206,6 +210,63 @@ class ShardSingleModalDataset(Dataset):
             )
 
         self._lazy_cache: 'OrderedDict[int, Tuple[np.ndarray, np.ndarray]]' = OrderedDict()
+        # Eager mode: pre-load only the relevant (modality, kept-segment) slices
+        # into a single in-memory float32 array, sized
+        # ``[len(_segment_index), T]``. Avoids re-reading network shards
+        # on every batch -- worth it when shards live on a slow filesystem and
+        # the resulting array fits in RAM.
+        self._eager_x: Optional[np.ndarray] = None
+        if self.eager:
+            self._eager_x = self._build_eager_array()
+
+    def _build_eager_array(self) -> np.ndarray:
+        """Read each needed shard ONCE in parallel and return a flat float32
+        array of shape ``[len(self._segment_index), T]`` where row ``i`` is
+        the modality channel data for ``self._segment_index[i]``.
+        """
+        # Group required (global_idx, seg_idx) by shard so each shard is
+        # opened exactly once.
+        by_shard: 'defaultdict[int, List[Tuple[int, int]]]' = defaultdict(list)
+        for global_i, (shard_pos, seg_idx) in enumerate(self._segment_index):
+            by_shard[shard_pos].append((global_i, seg_idx))
+
+        # Probe one shard to learn T (segment length). Cheap relative to
+        # the full eager load.
+        sample_path = os.path.join(self.data_dir,
+                                   self._shards[next(iter(by_shard))]['path'])
+        with np.load(sample_path, allow_pickle=True) as arr:
+            T = int(arr['x'].shape[-1])
+
+        out = np.empty((len(self._segment_index), T), dtype=np.float32)
+
+        def _load_one(shard_pos: int):
+            path = os.path.join(self.data_dir, self._shards[shard_pos]['path'])
+            with np.load(path, allow_pickle=True) as arr:
+                xs = np.asarray(arr['x'], dtype=np.float32)  # [N, M, T]
+            picks = by_shard[shard_pos]
+            results: List[Tuple[int, np.ndarray]] = []
+            for global_i, seg_idx in picks:
+                results.append((global_i, xs[seg_idx, self.ch_idx, :].copy()))
+            return results
+
+        if self.eager_workers <= 1:
+            it = (_load_one(s) for s in by_shard)
+        else:
+            from multiprocessing.pool import ThreadPool
+            pool = ThreadPool(self.eager_workers)
+            it = pool.imap_unordered(_load_one, by_shard.keys())
+
+        try:
+            for results in tqdm.tqdm(it, total=len(by_shard),
+                                     desc=f'eager-load ch={self.ch_idx}'):
+                for gi, vec in results:
+                    out[gi] = vec
+        finally:
+            if self.eager_workers > 1:
+                pool.close()
+                pool.join()
+
+        return out
 
     def __len__(self) -> int:
         return len(self._segment_index)
@@ -233,9 +294,12 @@ class ShardSingleModalDataset(Dataset):
         return xs, masks
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        local_shard_pos, seg_idx = self._segment_index[idx]
-        xs, _masks = self._load_shard(local_shard_pos)
-        x = xs[seg_idx, self.ch_idx].copy()  # [T]
+        if self._eager_x is not None:
+            x = self._eager_x[idx].copy()  # [T]
+        else:
+            local_shard_pos, seg_idx = self._segment_index[idx]
+            xs, _masks = self._load_shard(local_shard_pos)
+            x = xs[seg_idx, self.ch_idx].copy()  # [T]
 
         if self.normalize:
             std = float(x.std())
