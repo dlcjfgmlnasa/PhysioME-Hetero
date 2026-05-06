@@ -206,7 +206,11 @@ class Trainer(object):
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model_parameter = ckpt['model_parameter']
         pretrained_model = NeuroNet(**model_parameter)
-        pretrained_model.load_state_dict(ckpt['model_state'])
+        # strict=False -- decoder layout was migrated from timm.Block to BFM
+        # TransformerEncoder; old Phase-1 ckpts lack the new decoder keys and
+        # vice versa. Phase-2 only transfers encoder + frame_backbone +
+        # cls_token, so missing/extra decoder keys are harmless here.
+        pretrained_model.load_state_dict(ckpt['model_state'], strict=False)
 
         # 2. NeuroNetEncoder — direct submodule transfer (no name-substring magic).
         backbone = NeuroNetEncoder(

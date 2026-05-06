@@ -1,16 +1,16 @@
 # -*- coding:utf-8 -*-
+from functools import partial
+from typing import List
+
 import torch
 import torch.nn as nn
-from typing import List
+
 from models.dp_neuronet.resnet1d import FrameBackBone
-from timm.models.vision_transformer import Block
-from models.utils import get_2d_sincos_pos_embed_flexible
+from models.loss import NTXentLoss
 from models.transformer import (
     TransformerEncoder, RMSNorm,
     QueryKeyProjection, RotaryProjection,
 )
-from models.loss import NTXentLoss
-from functools import partial
 
 
 def _build_projector(in_dim: int, hidden: List[int]) -> nn.Sequential:
@@ -230,13 +230,6 @@ class MaskedAutoEncoderViT(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
         self.embed_dim = encoder_embed_dim
         self.encoder_depths = encoder_depths
-        self.mlp_ratio = 4.
-
-        self.input_size = (num_patches, encoder_embed_dim)
-        self.patch_size = (1, encoder_embed_dim)
-        self.grid_h = int(self.input_size[0] // self.patch_size[0])
-        self.grid_w = int(self.input_size[1] // self.patch_size[1])
-        self.num_patches = self.grid_h * self.grid_w
 
         # MAE Encoder — uni2ts-derived TransformerEncoder (GQA + GLU FFN + RMSNorm + RoPE).
         # final norm is folded into the encoder; we expose ``encoder_norm`` as an alias for
@@ -246,16 +239,15 @@ class MaskedAutoEncoderViT(nn.Module):
         )
         self.encoder_norm = self.encoder.norm
 
-        # MAE Decoder
+        # MAE Decoder — uni2ts-derived TransformerEncoder (GQA + GLU FFN +
+        # RMSNorm + RoPE), matching the encoder. RoPE handles positions inside
+        # attention, so no additive ``decoder_pos_embed`` is needed; the final
+        # RMSNorm is folded into the encoder block (no separate ``decoder_norm``).
         self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.num_patches, decoder_embed_dim), requires_grad=False)
-        self.decoder_block = nn.ModuleList([
-            Block(decoder_embed_dim, decoder_heads, self.mlp_ratio, qkv_bias=True,
-                  norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            for _ in range(decoder_depths)
-        ])
-        self.decoder_norm = nn.LayerNorm(decoder_embed_dim, eps=1e-6)
+        self.decoder = _build_rope_encoder(
+            d_model=decoder_embed_dim, num_heads=decoder_heads, num_layers=decoder_depths,
+        )
         self.decoder_pred = nn.Linear(decoder_embed_dim, recon_size, bias=True)
         self.initialize_weights()
 
@@ -288,14 +280,8 @@ class MaskedAutoEncoderViT(nn.Module):
         x_ = torch.cat([x, mask_tokens], dim=1)  # no cls token
         x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
 
-        # add pos embed
-        x = x + self.decoder_pos_embed
-
-        # apply Transformer blocks
-        for block in self.decoder_block:
-            x = block(x)
-
-        x = self.decoder_norm(x)
+        # apply Transformer decoder (RoPE inside attention; final RMSNorm folded in)
+        x = self.decoder(x)
 
         # predictor projection
         x = self.decoder_pred(x)
@@ -324,13 +310,8 @@ class MaskedAutoEncoderViT(nn.Module):
         return x_masked, mask, ids_restore
 
     def initialize_weights(self):
-        # Decoder still uses absolute sin-cos pos embedding (length is fixed = num_patches).
-        # Encoder side relies on RoPE inside attention, so no encoder pos_embed init needed.
-        decoder_pos_embed = get_2d_sincos_pos_embed_flexible(self.decoder_pos_embed.shape[-1],
-                                                             (self.grid_h, self.grid_w),
-                                                             cls_token=False)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
-
+        # RoPE inside both encoder and decoder attention -> no additive position
+        # tables to seed. Just initialise the learned token parameters.
         torch.nn.init.normal_(self.cls_token, std=.02)
         torch.nn.init.normal_(self.mask_token, std=.02)
         self.apply(self._init_weights)
@@ -351,7 +332,6 @@ class NeuroNetEncoder(nn.Module):
     def __init__(self, fs: int, second: int, time_window: int, time_step: float,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int):
         super().__init__()
-        self.mlp_ratio = 4.0
         self.fs, self.second = fs, second
         self.time_window, self.time_step = time_window, time_step
         self.window_samples = int(time_window * fs)
@@ -363,8 +343,6 @@ class NeuroNetEncoder(nn.Module):
         self.num_patches, self.frame_size = frame_size(
             fs=fs, second=second, time_window=time_window, time_step=time_step,
         )
-        self.grid_h = int(self.num_patches // 1)
-        self.grid_w = int(self.encoder_embed_dim // self.encoder_embed_dim)
 
         self.frame_backbone = FrameBackBone(fs=fs, window=time_window)
         self.patch_embed = nn.Linear(self.frame_backbone.feature_num, encoder_embed_dim)

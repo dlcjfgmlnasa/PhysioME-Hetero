@@ -161,7 +161,12 @@ class HeteroTrainer:
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model_parameter = ckpt['model_parameter']
         pretrained_model = NeuroNet(**model_parameter)
-        pretrained_model.load_state_dict(ckpt['model_state'])
+        # strict=False: tolerates Phase-1 ckpts saved before the MAE decoder
+        # was migrated from timm.Block to BFM TransformerEncoder. The encoder
+        # / frame_backbone / cls_token weights -- the only ones Phase-2 actually
+        # transfers -- are present in both layouts; only the decoder keys
+        # differ and Phase-2 discards the decoder anyway.
+        pretrained_model.load_state_dict(ckpt['model_state'], strict=False)
 
         backbone = NeuroNetEncoder(
             fs=model_parameter['fs'], second=model_parameter['second'],
