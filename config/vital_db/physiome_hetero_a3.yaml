@@ -2,7 +2,7 @@
 # All other settings identical to physiome_hetero.yaml.
 # Train with: python pretrained/physiome/train_hetero.py --config_yaml config/vital_db/physiome_hetero_a3.yaml
 
-ssl_data_dir: '../../data/vitaldb_ssl'
+ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 labeled_data_dir: '../../data/vitaldb'
 
 holdout_subject_size: 100

@@ -1,7 +1,7 @@
 # Phase-1 NeuroNet (TF-C) pretraining — single modality at a time.
 # Reads sharded SSL data produced by dataset/data_parser/vital_db_ssl.py.
 
-ssl_data_dir: '../../data/vitaldb_ssl'
+ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 
 ch_names:
   - 'ABP'

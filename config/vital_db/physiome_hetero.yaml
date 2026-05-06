@@ -4,7 +4,7 @@
 # ``labeled_data_dir`` (output of dataset/data_parser/vital_db.py) for
 # per-epoch linear-probe validation.
 
-ssl_data_dir: '../../data/vitaldb_ssl'
+ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 labeled_data_dir: '../../data/vitaldb'
 
 # Subject split for SSL pretraining and labeled probing.
