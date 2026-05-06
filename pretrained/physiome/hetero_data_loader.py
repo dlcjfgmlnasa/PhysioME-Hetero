@@ -53,6 +53,45 @@ PRESENCE_SYNTH_DROPPED: int = 1
 PRESENCE_NATURALLY_ABSENT: int = 2
 
 MANIFEST_NAME: str = 'manifest.json'
+CASE_INDEX_NAME: str = 'case_index.json'
+
+
+def load_holdout_case_ids(path: Optional[str]) -> Optional[set]:
+    """Load a holdout-subjects JSON written by ``sample_holdout`` and return
+    a set of case_id strings. ``None`` -> no exclusion."""
+    if not path:
+        return None
+    with open(path, 'r') as f:
+        payload = json.load(f)
+    return set(str(c) for c in payload['case_ids'])
+
+
+def _build_segment_case_ids(data_dir: str, num_shards: int,
+                            shard_paths: List[str]) -> Optional[List[List[str]]]:
+    """Read ``case_index.json`` next to manifest if present and expand it into
+    per-shard lists of length ``n_segments`` mapping segment -> case_id.
+
+    Returns ``None`` if the sidecar is absent (so old data dirs without a
+    sidecar still work — exclusion just won't be possible there).
+    """
+    sidecar = os.path.join(data_dir, CASE_INDEX_NAME)
+    if not os.path.isfile(sidecar):
+        return None
+    with open(sidecar, 'r') as f:
+        ci = json.load(f)
+    by_path = {s['path']: s for s in ci['shards']}
+    out: List[List[str]] = []
+    for sp in shard_paths:
+        meta = by_path.get(sp)
+        if meta is None:
+            return None
+        case_ids_unique = meta['case_ids_unique']
+        case_offsets = meta['case_offsets']
+        seg_case_ids = []
+        for k, cid in enumerate(case_ids_unique):
+            seg_case_ids.extend([cid] * (case_offsets[k + 1] - case_offsets[k]))
+        out.append(seg_case_ids)
+    return out
 
 
 def _bitmap_to_key(bitmap: Sequence[bool]) -> str:
@@ -98,7 +137,8 @@ class HeteroVitalDBDataset(Dataset):
     """
 
     def __init__(self, data_dir: str, eager: bool = False,
-                 normalize: bool = True, shard_cache_size: int = 4):
+                 normalize: bool = True, shard_cache_size: int = 4,
+                 exclude_case_ids: Optional[set] = None):
         self.data_dir = data_dir
         self.eager = eager
         self.normalize = normalize
@@ -120,9 +160,26 @@ class HeteroVitalDBDataset(Dataset):
         if not self._shards:
             raise RuntimeError(f'Manifest at {manifest_path} has zero shards.')
 
+        # Optional case-id holdout: requires case_index.json sidecar
+        # (built once via dataset/data_parser/build_case_index.py).
+        seg_case_ids_per_shard: Optional[List[List[str]]] = None
+        if exclude_case_ids:
+            seg_case_ids_per_shard = _build_segment_case_ids(
+                data_dir, len(self._shards),
+                [s['path'] for s in self._shards],
+            )
+            if seg_case_ids_per_shard is None:
+                raise FileNotFoundError(
+                    f'exclude_case_ids was supplied but no '
+                    f'{CASE_INDEX_NAME!r} sidecar was found in {data_dir!r}. '
+                    f'Run: python -m dataset.data_parser.build_case_index '
+                    f'--data_dir {data_dir!r}'
+                )
+
         # Flat segment index: (shard_idx, local_seg_idx).
         self._segment_index: List[Tuple[int, int]] = []
         self._segment_bitmap_keys: List[str] = []
+        n_excluded = 0
         for si, shard in enumerate(self._shards):
             keys = shard['bitmap_keys']
             n = int(shard['n_segments'])
@@ -132,8 +189,14 @@ class HeteroVitalDBDataset(Dataset):
                     f'manifest has {len(keys)} bitmap_keys.'
                 )
             for li in range(n):
+                if seg_case_ids_per_shard is not None:
+                    if seg_case_ids_per_shard[si][li] in exclude_case_ids:
+                        n_excluded += 1
+                        continue
                 self._segment_index.append((si, li))
                 self._segment_bitmap_keys.append(keys[li])
+
+        self._n_excluded_segments = n_excluded
 
         # Shard payload storage.
         self._eager_shards: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
@@ -155,6 +218,10 @@ class HeteroVitalDBDataset(Dataset):
     @property
     def num_cases(self) -> int:
         return int(sum(int(s.get('n_cases', 0)) for s in self._shards))
+
+    @property
+    def n_excluded_segments(self) -> int:
+        return self._n_excluded_segments
 
     # ---------------- shard I/O ----------------
     def _read_shard(self, shard_idx: int) -> Tuple[np.ndarray, np.ndarray]:

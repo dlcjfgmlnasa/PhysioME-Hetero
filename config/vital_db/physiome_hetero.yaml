@@ -5,6 +5,12 @@
 # per-epoch linear-probe validation.
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
+
+# Subject-level holdout for downstream evaluation. Same list must be used
+# for Phase-1 (dp_neuronet.yaml) and downstream evaluators -- otherwise
+# subjects leak across stages. See dataset/data_parser/{build_case_index,
+# sample_holdout}.py.
+holdout_subjects_file: null
 labeled_data_dir: '../../data/vitaldb'
 
 # Subject split for SSL pretraining and labeled probing.

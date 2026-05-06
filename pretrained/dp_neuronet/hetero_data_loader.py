@@ -39,6 +39,42 @@ from torch.utils.data import Dataset, Sampler
 
 
 MANIFEST_NAME: str = 'manifest.json'
+CASE_INDEX_NAME: str = 'case_index.json'
+
+
+def load_holdout_case_ids(path: Optional[str]) -> Optional[set]:
+    """Load a holdout-subjects JSON written by ``sample_holdout``."""
+    if not path:
+        return None
+    with open(path, 'r') as f:
+        payload = json.load(f)
+    return set(str(c) for c in payload['case_ids'])
+
+
+def _build_segment_case_ids(data_dir: str,
+                            shard_paths: List[str]) -> Optional[List[List[str]]]:
+    """Read ``case_index.json`` and expand into per-shard segment->case_id lists.
+
+    Returns ``None`` if the sidecar is absent.
+    """
+    sidecar = os.path.join(data_dir, CASE_INDEX_NAME)
+    if not os.path.isfile(sidecar):
+        return None
+    with open(sidecar, 'r') as f:
+        ci = json.load(f)
+    by_path = {s['path']: s for s in ci['shards']}
+    out: List[List[str]] = []
+    for sp in shard_paths:
+        meta = by_path.get(sp)
+        if meta is None:
+            return None
+        case_ids_unique = meta['case_ids_unique']
+        case_offsets = meta['case_offsets']
+        seg_case_ids = []
+        for k, cid in enumerate(case_ids_unique):
+            seg_case_ids.extend([cid] * (case_offsets[k + 1] - case_offsets[k]))
+        out.append(seg_case_ids)
+    return out
 
 
 def _read_manifest(data_dir: str) -> dict:
@@ -91,7 +127,8 @@ class ShardSingleModalDataset(Dataset):
 
     def __init__(self, data_dir: str, ch_idx: int,
                  shard_indices: Optional[Sequence[int]] = None,
-                 normalize: bool = True, shard_cache_size: int = 4):
+                 normalize: bool = True, shard_cache_size: int = 4,
+                 exclude_case_ids: Optional[set] = None):
         self.data_dir = data_dir
         self.ch_idx = int(ch_idx)
         self.normalize = bool(normalize)
@@ -126,9 +163,24 @@ class ShardSingleModalDataset(Dataset):
         self._shards: List[dict] = [all_shards[i] for i in shard_indices]
         self._shard_ids: List[int] = list(shard_indices)
 
+        # Optional case-id holdout: requires case_index.json sidecar.
+        seg_case_ids_per_shard: Optional[List[List[str]]] = None
+        if exclude_case_ids:
+            seg_case_ids_per_shard = _build_segment_case_ids(
+                data_dir, [s['path'] for s in self._shards],
+            )
+            if seg_case_ids_per_shard is None:
+                raise FileNotFoundError(
+                    f'exclude_case_ids was supplied but no '
+                    f'{CASE_INDEX_NAME!r} sidecar was found in {data_dir!r}. '
+                    f'Run: python -m dataset.data_parser.build_case_index '
+                    f'--data_dir {data_dir!r}'
+                )
+
         # Filter to segments where this modality is actually present (mask=1).
         # The manifest carries per-segment ``bitmap_keys`` so this is cheap.
         self._segment_index: List[Tuple[int, int]] = []  # (local_shard_pos, seg_idx)
+        n_excluded = 0
         for li, shard in enumerate(self._shards):
             keys = shard['bitmap_keys']
             n = int(shard['n_segments'])
@@ -138,8 +190,14 @@ class ShardSingleModalDataset(Dataset):
                     f'manifest lists {len(keys)} bitmap_keys.'
                 )
             for seg, key in enumerate(keys):
-                if key[self.ch_idx] == '1':
-                    self._segment_index.append((li, seg))
+                if key[self.ch_idx] != '1':
+                    continue
+                if seg_case_ids_per_shard is not None:
+                    if seg_case_ids_per_shard[li][seg] in exclude_case_ids:
+                        n_excluded += 1
+                        continue
+                self._segment_index.append((li, seg))
+        self._n_excluded_segments = n_excluded
 
         if not self._segment_index:
             raise RuntimeError(
@@ -155,6 +213,10 @@ class ShardSingleModalDataset(Dataset):
     @property
     def num_shards(self) -> int:
         return len(self._shards)
+
+    @property
+    def n_excluded_segments(self) -> int:
+        return self._n_excluded_segments
 
     def _load_shard(self, local_shard_pos: int) -> Tuple[np.ndarray, np.ndarray]:
         cached = self._lazy_cache.get(local_shard_pos)

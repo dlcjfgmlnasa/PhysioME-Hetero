@@ -51,6 +51,7 @@ from pretrained.physiome.hetero_data_loader import (
     HeteroVitalDBDataset,
     find_ssl_data_dir,
     hetero_collate_fn,
+    load_holdout_case_ids,
 )
 from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
 
@@ -128,6 +129,8 @@ class HeteroTrainer:
         print(f'   >> Model Size       : {model_size(self.model):.2f} MB')
         print(f'   >> Learning rate    : {self.lr}')
         print(f'   >> SSL data dir     : {self.ssl_data_dir}')
+        print(f'   >> Holdout subjects : '
+              f'{getattr(self.args, "holdout_subjects_file", None) or "<none>"}')
         print(f'   >> Labeled subjects : '
               f'{len(self.labeled_train_paths)} train / '
               f'{len(self.labeled_val_paths)} val / '
@@ -191,11 +194,15 @@ class HeteroTrainer:
     # Training loop
     # ------------------------------------------------------------------
     def train(self):
+        holdout = load_holdout_case_ids(
+            getattr(self.args, 'holdout_subjects_file', None)
+        )
         ssl_dataset = HeteroVitalDBDataset(
             self.ssl_data_dir,
             eager=self.args.dataloader_eager,
             normalize=self.args.dataloader_normalize,
             shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
+            exclude_case_ids=holdout,
         )
         self._ssl_dataset_stats = (
             ssl_dataset.num_shards, len(ssl_dataset), ssl_dataset.num_cases,

@@ -35,6 +35,7 @@ from models.utils import model_size
 from pretrained.dp_neuronet.hetero_data_loader import (
     ShardSequentialSampler,
     ShardSingleModalDataset,
+    load_holdout_case_ids,
     split_shards,
 )
 
@@ -71,6 +72,10 @@ def get_args():
                         help='override shard_cache_size from yaml')
     parser.add_argument('--prefetch_factor', type=int, default=None,
                         help='override DataLoader prefetch_factor from yaml')
+    parser.add_argument('--holdout_subjects_file', type=str, default=None,
+                        help='override holdout_subjects_file from yaml '
+                             '(JSON written by sample_holdout). Excludes '
+                             'those case_ids from Phase-1 SSL training.')
     return parser.parse_args()
 
 
@@ -137,14 +142,20 @@ class Trainer(object):
             getattr(self.args, 'num_workers', 0),
             getattr(self.args, 'shard_cache_size', 4),
         ))
+        holdout_path = getattr(self.args, 'holdout_subjects_file', None)
+        print('   >> Holdout : {0}'.format(holdout_path or '<none>'))
 
     def _build_loader(self, shard_indices, shuffle: bool, drop_last: bool) -> DataLoader:
+        holdout = load_holdout_case_ids(
+            getattr(self.args, 'holdout_subjects_file', None)
+        )
         dataset = ShardSingleModalDataset(
             data_dir=self.args.ssl_data_dir,
             ch_idx=self.args.ch_idx,
             shard_indices=shard_indices,
             normalize=getattr(self.args, 'dataloader_normalize', True),
             shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
+            exclude_case_ids=holdout,
         )
         num_workers = int(getattr(self.args, 'num_workers', 0) or 0)
 
@@ -298,6 +309,7 @@ if __name__ == '__main__':
                                       'ssl_data_dir': cli.ssl_data_dir,
                                       'num_workers': cli.num_workers,
                                       'shard_cache_size': cli.shard_cache_size,
-                                      'prefetch_factor': cli.prefetch_factor})
+                                      'prefetch_factor': cli.prefetch_factor,
+                                      'holdout_subjects_file': cli.holdout_subjects_file})
     trainer = Trainer(augments)
     trainer.train()
