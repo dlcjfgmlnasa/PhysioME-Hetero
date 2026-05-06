@@ -15,12 +15,15 @@ class FrameBackBone(nn.Module):
         )
 
     def forward(self, x):
-        latent_seq = []
-        for i in range(x.shape[1]):
-            sample = torch.unsqueeze(x[:, i, :], dim=1)
-            latent = self.model(sample)
-            latent_seq.append(latent)
-        latent_seq = torch.stack(latent_seq, dim=1)
+        # x: [B, F, W] -> batched conv on (B*F, 1, W) -> [B, F, feature_num]
+        # Replaces a 20x Python-for-loop over frames that was launching
+        # ~3000+ tiny CUDA kernels per forward and pinning L40S to its
+        # kernel-launch ceiling (~10us each). Single batched call lets the
+        # CNN saturate the GPU.
+        b, f, w = x.shape
+        flat = x.reshape(b * f, 1, w)                # (B*F, 1, W)
+        latent = self.model(flat)                    # (B*F, D')
+        latent_seq = latent.reshape(b, f, -1)        # (B, F, D')
         latent_seq = self.feature_layer(latent_seq)
         return latent_seq
 
