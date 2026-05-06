@@ -29,7 +29,6 @@ decoder_embed_dim: 256
 decoder_heads: 8
 decoder_depths: 3
 decoder_recon_depths: 8
-alpha: 1.0
 projection_hidden:
   - 1024
   - 512

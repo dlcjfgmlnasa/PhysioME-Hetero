@@ -10,7 +10,6 @@ REQUIRED = [
     # Models / training
     ('timm', None),
     ('einops', None),
-    ('peft', None),
     # SSL / metrics
     ('sklearn', 'scikit-learn'),
     ('mne', None),
