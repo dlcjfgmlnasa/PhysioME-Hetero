@@ -61,6 +61,13 @@ def get_args():
                         help='override ch_idx from yaml (0=ABP, 1=ECG, 2=PPG, 3=CVP)')
     parser.add_argument('--ckpt_path', type=str, default=None,
                         help='override ckpt_path from yaml')
+    parser.add_argument('--ssl_data_dir', type=str, default=None,
+                        help='override ssl_data_dir from yaml '
+                             '(e.g. point at a local-SSD copy of the shards)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='override num_workers from yaml')
+    parser.add_argument('--shard_cache_size', type=int, default=None,
+                        help='override shard_cache_size from yaml')
     return parser.parse_args()
 
 
@@ -111,13 +118,21 @@ class Trainer(object):
         self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
 
         print('[NeuroNet Parameter]')
+        print('   >> Device     : {0}'.format(device))
+        if device.type == 'cuda':
+            print('   >> GPU Name   : {0}'.format(torch.cuda.get_device_name(device)))
         print('   >> Model Size : {0:.2f}MB'.format(model_size(self.model)))
         print('   >> Modal Name : {0}'.format(self.modal_name))
+        print('   >> Data Dir   : {0}'.format(self.args.ssl_data_dir))
         print('   >> Frame Size : {0}'.format(self.model.num_patches))
         print('   >> Learning Rate : {0}'.format(self.lr))
         print('   >> Shards : {0} total -> train {1} / val {2} / eval {3}'.format(
             self.num_shards, len(self.train_shards),
             len(self.val_shards), len(self.eval_shards),
+        ))
+        print('   >> Workers : {0} / shard_cache_size : {1}'.format(
+            getattr(self.args, 'num_workers', 0),
+            getattr(self.args, 'shard_cache_size', 4),
         ))
 
     def _build_loader(self, shard_indices, shuffle: bool, drop_last: bool) -> DataLoader:
@@ -246,6 +261,9 @@ if __name__ == '__main__':
     cli = get_args()
     augments = load_config(path=cli.config_yaml,
                            overrides={'ch_idx': cli.ch_idx,
-                                      'ckpt_path': cli.ckpt_path})
+                                      'ckpt_path': cli.ckpt_path,
+                                      'ssl_data_dir': cli.ssl_data_dir,
+                                      'num_workers': cli.num_workers,
+                                      'shard_cache_size': cli.shard_cache_size})
     trainer = Trainer(augments)
     trainer.train()
