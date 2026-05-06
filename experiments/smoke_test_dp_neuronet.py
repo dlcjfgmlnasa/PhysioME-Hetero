@@ -25,6 +25,7 @@ sys.path.insert(0, ROOT)
 from dataset.data_parser.vital_db_ssl import ShardWriter  # noqa: E402
 from models.dp_neuronet.model import NeuroNet  # noqa: E402
 from pretrained.dp_neuronet.hetero_data_loader import (  # noqa: E402
+    ShardSequentialSampler,
     ShardSingleModalDataset,
     split_shards,
 )
@@ -93,8 +94,33 @@ def main() -> None:
         print(f'[smoke] PPG train segments={len(train_ds)}  '
               f'val segments={len(val_ds)}')
 
-        train_loader = DataLoader(train_ds, batch_size=8, shuffle=True,
-                                  drop_last=True)
+        # Verify ShardSequentialSampler: each shard's segments must come out
+        # contiguously (no inter-shard interleaving).
+        sampler = ShardSequentialSampler(train_ds, seed=0, shuffle_shards=True)
+        order = list(iter(sampler))
+        shard_seen = []
+        for i in order:
+            shard_pos, _ = train_ds._segment_index[i]
+            if not shard_seen or shard_seen[-1] != shard_pos:
+                shard_seen.append(shard_pos)
+        # If sampler walks shards sequentially each shard appears exactly once
+        # in the per-shard transition log; if it shuffled across shards it would
+        # appear many times.
+        assert len(shard_seen) == len(set(shard_seen)), (
+            f'ShardSequentialSampler interleaved shards: '
+            f'transitions={shard_seen}'
+        )
+        sampler.set_epoch(1)
+        order_e1 = list(iter(sampler))
+        assert order != order_e1, 'set_epoch did not change sampling order'
+        print(f'[smoke] sequential sampler: shards walked in '
+              f'{len(shard_seen)} blocks (no interleaving), set_epoch reseeds OK')
+
+        train_loader = DataLoader(
+            train_ds, batch_size=8,
+            sampler=ShardSequentialSampler(train_ds, seed=0),
+            drop_last=True,
+        )
         val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
 
         # Smaller-than-prod NeuroNet — exercises the same code paths quickly.

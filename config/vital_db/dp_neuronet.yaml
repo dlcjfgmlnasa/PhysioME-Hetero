@@ -19,9 +19,16 @@ class_downsampling: true
 data_augmentation_prob: 0.90
 
 # DataLoader (sharded reader).
+# When shards live on a slow filesystem (network drive), the trainer uses
+# ShardSequentialSampler so each shard is loaded exactly once per epoch and
+# persistent_workers + prefetch_factor hide the network read behind GPU
+# compute. shard_cache_size of 1 is sufficient under sequential sampling
+# (worker chews through one shard before opening the next); bump to 2-4 to
+# absorb prefetch overlap.
 dataloader_normalize: true
-shard_cache_size: 4
-num_workers: 4
+shard_cache_size: 2
+num_workers: 8
+prefetch_factor: 4
 
 # Shard-level split (parser writes shards in case-arrival order ->
 # contiguous slices are approximately subject-disjoint).

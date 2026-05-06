@@ -33,6 +33,7 @@ from torch.utils.tensorboard import SummaryWriter
 from models.dp_neuronet.model import NeuroNet
 from models.utils import model_size
 from pretrained.dp_neuronet.hetero_data_loader import (
+    ShardSequentialSampler,
     ShardSingleModalDataset,
     split_shards,
 )
@@ -68,6 +69,8 @@ def get_args():
                         help='override num_workers from yaml')
     parser.add_argument('--shard_cache_size', type=int, default=None,
                         help='override shard_cache_size from yaml')
+    parser.add_argument('--prefetch_factor', type=int, default=None,
+                        help='override DataLoader prefetch_factor from yaml')
     return parser.parse_args()
 
 
@@ -143,15 +146,40 @@ class Trainer(object):
             normalize=getattr(self.args, 'dataloader_normalize', True),
             shard_cache_size=getattr(self.args, 'shard_cache_size', 4),
         )
-        loader = DataLoader(
+        num_workers = int(getattr(self.args, 'num_workers', 0) or 0)
+
+        # Sequential-shard sampler so each shard is loaded once per epoch.
+        # Critical when shards live on a slow / network filesystem -- random
+        # segment shuffling there yields ~0% cache hits and pegs the GPU at
+        # 0% util. Sampler shuffles shard *order* across epochs and segment
+        # order within each shard, preserving training stochasticity.
+        if shuffle:
+            sampler = ShardSequentialSampler(
+                dataset, seed=getattr(self.args, 'seed', 0),
+                shuffle_shards=True,
+            )
+            loader_kwargs = dict(sampler=sampler)
+        else:
+            loader_kwargs = dict(shuffle=False)
+
+        # persistent_workers + prefetch_factor lets workers keep their shard
+        # cache hot across epochs and overlap network I/O with GPU compute.
+        if num_workers > 0:
+            loader_kwargs.update(
+                num_workers=num_workers,
+                persistent_workers=True,
+                prefetch_factor=int(getattr(self.args, 'prefetch_factor', 4)),
+            )
+        else:
+            loader_kwargs.update(num_workers=0)
+
+        return DataLoader(
             dataset,
             batch_size=self.args.train_batch_size,
-            shuffle=shuffle,
             drop_last=drop_last,
-            num_workers=getattr(self.args, 'num_workers', 0),
             pin_memory=torch.cuda.is_available(),
+            **loader_kwargs,
         )
-        return loader
 
     def train(self):
         train_dataloader = self._build_loader(self.train_shards, shuffle=True, drop_last=True)
@@ -164,6 +192,11 @@ class Trainer(object):
         best_model_state, best_val_loss = self.model.state_dict(), float('inf')
 
         for epoch in range(self.args.train_epochs):
+            # Reseed the sampler so shard order + intra-shard shuffle change.
+            sampler = getattr(train_dataloader, 'sampler', None)
+            if sampler is not None and hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
+
             step = 0
             self.model.train()
             self.optimizer.zero_grad()
@@ -264,6 +297,7 @@ if __name__ == '__main__':
                                       'ckpt_path': cli.ckpt_path,
                                       'ssl_data_dir': cli.ssl_data_dir,
                                       'num_workers': cli.num_workers,
-                                      'shard_cache_size': cli.shard_cache_size})
+                                      'shard_cache_size': cli.shard_cache_size,
+                                      'prefetch_factor': cli.prefetch_factor})
     trainer = Trainer(augments)
     trainer.train()

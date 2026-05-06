@@ -31,11 +31,11 @@ from __future__ import annotations
 import json
 import os
 from collections import OrderedDict
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 MANIFEST_NAME: str = 'manifest.json'
@@ -183,6 +183,68 @@ class ShardSingleModalDataset(Dataset):
         # NeuroNet's TF-C trainer signature is ``for x, _ in loader``.
         # SSL has no labels, so y is a dummy zero tensor.
         return torch.from_numpy(x), torch.tensor(0, dtype=torch.long)
+
+
+class ShardSequentialSampler(Sampler[int]):
+    """Walk shards one at a time; segments within each shard are shuffled.
+
+    Why: with random segment shuffling across 521 shards (~30 GB on a slow
+    network drive), every batch hits a different shard -> cache hit rate ~0%
+    -> dataloader pays the full ~10s shard decompression every batch -> GPU
+    starves. Walking shards sequentially means each shard is loaded **exactly
+    once per epoch** instead of dozens of times. Combined with
+    ``persistent_workers=True`` and ``prefetch_factor>=2`` on the DataLoader,
+    workers prefetch the next shard while the trainer chews through the
+    current one, so most of the network read is hidden behind GPU compute.
+
+    Per-epoch behaviour:
+      1. Shuffle the *order* of shards (not segments across shards).
+      2. For each shard, shuffle the segments inside it and yield them.
+
+    Cross-epoch determinism: ``set_epoch(epoch)`` updates the rng seed.
+
+    Args:
+        dataset: a ``ShardSingleModalDataset`` (uses ``_segment_index`` to
+            recover the per-segment shard membership).
+        seed: rng seed for shard-order + intra-shard shuffles.
+        shuffle_shards: if False, walk shards in their stored order each epoch
+            (still shuffles segments inside each shard). Useful for
+            reproducibility / debugging.
+    """
+
+    def __init__(self, dataset: 'ShardSingleModalDataset',
+                 seed: int = 0, shuffle_shards: bool = True):
+        if not hasattr(dataset, '_segment_index'):
+            raise TypeError(
+                'ShardSequentialSampler expects a ShardSingleModalDataset.'
+            )
+        self.seed = int(seed)
+        self.shuffle_shards = bool(shuffle_shards)
+        self._epoch = 0
+
+        # Group dataset indices by shard position.
+        by_shard: 'OrderedDict[int, List[int]]' = OrderedDict()
+        for global_idx, (shard_pos, _seg) in enumerate(dataset._segment_index):
+            by_shard.setdefault(shard_pos, []).append(global_idx)
+        self._by_shard = by_shard
+        self._n = sum(len(v) for v in by_shard.values())
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng(self.seed + self._epoch)
+        shard_keys = list(self._by_shard.keys())
+        if self.shuffle_shards:
+            rng.shuffle(shard_keys)
+        for s in shard_keys:
+            indices = list(self._by_shard[s])
+            rng.shuffle(indices)
+            for idx in indices:
+                yield idx
 
 
 if __name__ == '__main__':
