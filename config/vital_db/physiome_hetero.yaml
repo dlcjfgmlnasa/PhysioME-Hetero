@@ -23,10 +23,10 @@ test_size: 0.20
 # CVP is sparse (~25% of cases, CV catheter is invasive / major surgery only),
 # which is the paper's headline hetero-availability signal.
 modality_name2path:
-  'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
-  'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
-  'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
-  'CVP': '../../ckpt/vitaldb/neuronet/CVP/neuronet/model/best_model.pth'
+  'ABP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ABP/model/best_model.pth'
+  'ECG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ECG/model/best_model.pth'
+  'PPG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/PPG/model/best_model.pth'
+  'CVP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CVP/model/best_model.pth'
 
 # Signal config.
 sfreq: 100
@@ -89,6 +89,8 @@ restoration_only_on_complete: true
 probe_max_subsets: 10
 
 print_point: 20
-ckpt_path: '../../ckpt/vital_db_hetero/'
+# Phase-2 ckpt root (same parent as Phase-1; model_name keeps them separate).
+# Save path: <ckpt_path>/physiome_hetero/...
+ckpt_path: '/home/coder/workspace/updown/physiome_hetero/ckpt/'
 model_name: 'physiome_hetero'
 seed: 777

@@ -65,5 +65,7 @@ temperature: 0.1
 mask_ratio: 0.8
 
 print_point: 20
-ckpt_path: '../../ckpt/vitaldb/'
+# Phase-1 ckpt root. With model_name='neuronet' the per-modality save path
+# becomes <ckpt_path>/neuronet/<MODAL>/model/best_model.pth.
+ckpt_path: '/home/coder/workspace/updown/physiome_hetero/ckpt/'
 model_name: 'neuronet'

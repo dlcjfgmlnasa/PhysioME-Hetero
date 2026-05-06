@@ -2,10 +2,10 @@ base_path: '../../data/vitaldb'
 holdout_subject_size: 100
 test_size: 0.20
 modality_name2path:
-  'ABP': '../../ckpt/vitaldb/neuronet/ABP/neuronet/model/best_model.pth'
-  'ECG': '../../ckpt/vitaldb/neuronet/ECG/neuronet/model/best_model.pth'
-  'PPG': '../../ckpt/vitaldb/neuronet/PPG/neuronet/model/best_model.pth'
-  'CVP': '../../ckpt/vitaldb/neuronet/CVP/neuronet/model/best_model.pth'
+  'ABP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ABP/model/best_model.pth'
+  'ECG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ECG/model/best_model.pth'
+  'PPG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/PPG/model/best_model.pth'
+  'CVP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CVP/model/best_model.pth'
 sfreq: 100
 rfreq: 100
 data_scaler: false
@@ -41,5 +41,5 @@ lora_alpha: 16
 lora_dropout: 0.05
 
 print_point: 20
-ckpt_path: '../../ckpt/vital_db/'
+ckpt_path: '/home/coder/workspace/updown/physiome_hetero/ckpt/'
 model_name: 'physiome'
