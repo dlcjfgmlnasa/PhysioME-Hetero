@@ -87,7 +87,12 @@ class NeuroNet(nn.Module):
         # Frequency-domain backbone (|FFT| magnitude per frame, zero-padded to W).
         self.frame_backbone_freq = FrameBackBone(fs=self.fs, window=self.time_window)
         # Shared autoencoder: same patch_embed / encoder / cls_token / decoder for both domains.
+        # recon_size = window_samples (W=300): decoder predicts the **raw frame** that was
+        # fed into frame_backbone (or its freq-domain counterpart freq_proj output), not
+        # the latent frame_backbone output. T = F * W exactly under no-overlap framing,
+        # so the per-frame raw target is dimensionally equivalent to the original signal.
         self.autoencoder = MaskedAutoEncoderViT(input_size=self.frame_backbone.feature_num,
+                                                recon_size=self.window_samples,
                                                 encoder_embed_dim=encoder_embed_dim, num_patches=self.num_patches,
                                                 encoder_heads=encoder_heads, encoder_depths=encoder_depths,
                                                 decoder_embed_dim=decoder_embed_dim, decoder_heads=decoder_heads,
@@ -106,7 +111,9 @@ class NeuroNet(nn.Module):
         window = int(time_window * fs)
         self.freq_proj = nn.Linear(window // 2 + 1, window)
 
-        self.norm_pix_loss = False
+        # Per-patch normalization stabilises raw-signal MAE (BFM / original MAE
+        # paper default). Without it the loss is dominated by per-patch DC offset.
+        self.norm_pix_loss = True
 
     # ------------------------------------------------------------------
     # View construction
@@ -139,9 +146,12 @@ class NeuroNet(nn.Module):
         latent_f1, pred_f1, mask_f1 = self.autoencoder(feat_f, mask_ratio)
         latent_f2 = self.autoencoder.forward_encoder(feat_f, mask_ratio)[0]
 
-        # 3. MAE reconstruction loss on both domains.
-        recon_loss = self.forward_mae_loss(feat_t, pred_t1, mask_t1) \
-                   + self.forward_mae_loss(feat_f, pred_f1, mask_f1)
+        # 3. MAE reconstruction loss on both domains -- raw signal target.
+        # Time view: predict frames_t (raw [B,F,W] window samples).
+        # Freq view: predict frames_f (freq_proj(|FFT|) input to freq backbone).
+        # Both [B,F,W=300]. Decoder Linear(decoder_embed_dim, W) outputs the same shape.
+        recon_loss = self.forward_mae_loss(frames_t, pred_t1, mask_t1) \
+                   + self.forward_mae_loss(frames_f, pred_f1, mask_f1)
 
         # 4. CLS tokens.
         o_t1, o_t2 = latent_t1[:, 0, :], latent_t2[:, 0, :]
@@ -208,9 +218,16 @@ class NeuroNet(nn.Module):
 class MaskedAutoEncoderViT(nn.Module):
     def __init__(self, input_size: int, num_patches: int,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
-                 decoder_embed_dim: int, decoder_heads: int, decoder_depths: int):
+                 decoder_embed_dim: int, decoder_heads: int, decoder_depths: int,
+                 recon_size: int = None):
         super().__init__()
         self.patch_embed = nn.Linear(input_size, encoder_embed_dim)
+        # recon_size: output dim of decoder_pred. Defaults to input_size for
+        # backward compatibility (latent self-distillation); pass W=window_samples
+        # to switch to raw-signal reconstruction (current NeuroNet default).
+        if recon_size is None:
+            recon_size = input_size
+        self.recon_size = recon_size
         self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
         self.embed_dim = encoder_embed_dim
         self.encoder_depths = encoder_depths
@@ -240,7 +257,7 @@ class MaskedAutoEncoderViT(nn.Module):
             for _ in range(decoder_depths)
         ])
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim, eps=1e-6)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, input_size, bias=True)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, recon_size, bias=True)
         self.initialize_weights()
 
     def forward(self, x, mask_ratio=0.8):
