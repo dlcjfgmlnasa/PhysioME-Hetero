@@ -34,6 +34,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from downstream.tasks.hypotension import HypotensionDataset
+from downstream.tasks.modality_forecast import ModalityForecastDataset
 from models.dp_neuronet.model import NeuroNet
 from models.utils import model_size
 from pretrained.dp_neuronet.hetero_data_loader import (
@@ -42,7 +43,11 @@ from pretrained.dp_neuronet.hetero_data_loader import (
     load_holdout_case_ids,
     split_shards,
 )
-from pretrained.probe_dev_data import load_dev_probe_split
+from pretrained.probe_dev_data import (
+    PHASE1_PROBE_TASK_FOR_MODAL,
+    load_dev_probe_modality_split,
+    load_dev_probe_split,
+)
 
 
 warnings.filterwarnings(action='ignore')
@@ -172,36 +177,68 @@ class Trainer(object):
             ))
 
         # ── Dev-cohort linear probing (optional) ──────────────────
-        # Probing is only meaningful for modalities that hypotension.py
-        # actually loads from the downstream npz (ABP/ECG/PPG); CVP windows
-        # are not produced there, so we skip probing for that channel.
+        # Per-modality dispatch (see PHASE1_PROBE_TASK_FOR_MODAL):
+        #   ABP/ECG/PPG → IOH probe (MAP-based, sustained <65 mmHg in 5 min).
+        #   CVP        → venous-congestion forecast (mean CVP > 12 mmHg).
+        #   CO2        → hypercapnia forecast (mean EtCO2 > 50 mmHg).
+        #   AWP        → high-airway-pressure forecast (peak AWP > 30 cmH2O).
+        # Each modality gets a probe so SSL training quality is monitored
+        # epoch-by-epoch instead of guessed from raw TF-C loss.
         self.probe_train_loader = None
         self.probe_eval_loader = None
+        self.probe_task_key: str = ''
         probe_dir = getattr(self.args, 'probe_downstream_dir', None)
         probe_subj = getattr(self.args, 'probe_subjects_file', None)
         if probe_dir and probe_subj:
-            if self.modal_name.upper() not in {'ABP', 'ECG', 'PPG'}:
-                print(f'   >> Probe   : skipped (modal {self.modal_name} '
-                      f'not produced by vital_db_downstream.py)')
-            else:
-                print(f'   >> Probe   : dev cohort -> {probe_subj}')
+            modal_upper = self.modal_name.upper()
+            task_key = PHASE1_PROBE_TASK_FOR_MODAL.get(modal_upper, '')
+            self.probe_task_key = task_key
+            if not task_key:
+                print(f'   >> Probe   : skipped (no probe task registered '
+                      f'for modal {self.modal_name})')
+            elif task_key == 'ioh':
+                print(f'   >> Probe   : IOH (dev cohort) -> {probe_subj}')
                 tr_s, ev_s = load_dev_probe_split(
                     downstream_dir=probe_dir,
                     dev_subjects_file=probe_subj,
-                    input_signals=(self.modal_name,),
+                    input_signals=(modal_upper,),
                 )
-                # Probing batches are small enough to leave on a single CPU
-                # worker — the LR fit dominates total probe time, not I/O.
                 self.probe_train_loader = DataLoader(
-                    HypotensionDataset(tr_s, modal_order=[self.modal_name]),
+                    HypotensionDataset(tr_s, modal_order=[modal_upper]),
                     batch_size=self.args.train_batch_size, shuffle=False,
                 )
                 self.probe_eval_loader = DataLoader(
-                    HypotensionDataset(ev_s, modal_order=[self.modal_name]),
+                    HypotensionDataset(ev_s, modal_order=[modal_upper]),
                     batch_size=self.args.train_batch_size, shuffle=False,
                 )
                 print(f'             samples: train={len(tr_s)} '
                       f'eval={len(ev_s)}  probe_every={self.args.probe_every}')
+            else:
+                print(f'   >> Probe   : self-modality forecast '
+                      f'({task_key}) -> {probe_subj}')
+                try:
+                    tr_s, ev_s = load_dev_probe_modality_split(
+                        downstream_dir=probe_dir,
+                        dev_subjects_file=probe_subj,
+                        task_key=task_key,
+                    )
+                    self.probe_train_loader = DataLoader(
+                        ModalityForecastDataset(tr_s, modal_order=[modal_upper]),
+                        batch_size=self.args.train_batch_size, shuffle=False,
+                    )
+                    self.probe_eval_loader = DataLoader(
+                        ModalityForecastDataset(ev_s, modal_order=[modal_upper]),
+                        batch_size=self.args.train_batch_size, shuffle=False,
+                    )
+                    print(f'             samples: train={len(tr_s)} '
+                          f'eval={len(ev_s)}  probe_every={self.args.probe_every}')
+                except RuntimeError as e:
+                    # Dev cohort doesn't include this modality on enough
+                    # subjects — log and continue without probing rather
+                    # than crash the SSL run.
+                    print(f'             [warn] modality probe disabled: {e}')
+                    self.probe_train_loader = None
+                    self.probe_eval_loader = None
 
     def _build_logger(self) -> logging.Logger:
         log_dir = os.path.join(self.args.ckpt_path, self.args.model_name,
@@ -348,11 +385,13 @@ class Trainer(object):
             if self.probe_train_loader is not None \
                     and (epoch + 1) % max(1, int(self.args.probe_every)) == 0:
                 auroc, mf1 = self._run_probe()
-                print('[Epoch] : {0:03d} \t [Probe AUROC] : {1:.4f} '
-                      '\t [Probe Macro-F1] : {2:.4f}\n'.format(epoch, auroc, mf1))
+                print('[Epoch] : {0:03d} \t [Probe {3}] AUROC : {1:.4f} '
+                      '\t Macro-F1 : {2:.4f}\n'.format(
+                        epoch, auroc, mf1, self.probe_task_key.upper()))
                 self.logger.info(
-                    'probe step=%08d epoch=%03d probe_auroc=%.4f probe_macro_f1=%.4f',
-                    total_step, epoch, auroc, mf1,
+                    'probe step=%08d epoch=%03d task=%s '
+                    'probe_auroc=%.4f probe_macro_f1=%.4f',
+                    total_step, epoch, self.probe_task_key, auroc, mf1,
                 )
 
             self.scheduler.step()
