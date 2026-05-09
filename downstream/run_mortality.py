@@ -7,9 +7,18 @@ Protocol:
   3. Fit LogisticRegression; AUROC + AUPRC + Sens@Sp90% across 2^N-1 subsets
   4. Save results/<tag>_mortality.csv
 
-For the cross-dataset story: pretrain on VitalDB, evaluate on MIMIC-III.
-All MIMIC-III subjects are used as the test set (zero-shot transfer):
-the model is never retrained on MIMIC data.
+External validation guarantees (no leakage):
+  * The encoder is pretrained ONLY on VitalDB (case_id, str namespace).
+  * MIMIC-III cohort is keyed by subject_id (int namespace).
+  * The two namespaces are disjoint by construction; no cross-dataset leak
+    is possible regardless of how splits inside MIMIC are drawn.
+
+Reproducibility:
+  * zero_shot mode uses StratifiedGroupKFold with shuffle=True and an
+    explicit ``random_state`` so fold assignments are deterministic.
+  * linear_probe mode uses sorted subject ids and a fixed train fraction
+    (or an external --mimic_holdout_subjects_file JSON) so the split is
+    fully reproducible.
 
 Usage (zero-shot transfer):
   python downstream/run_mortality.py \\
@@ -21,15 +30,19 @@ Usage (zero-shot transfer):
 
 Usage (linear probing with subject-level split):
   python downstream/run_mortality.py ... --mode linear_probe
+  # optional reproducible test cohort
+  python downstream/run_mortality.py ... --mode linear_probe \\
+      --mimic_holdout_subjects_file data/mimic3_hetero/holdout_subject_ids.json
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import warnings
 from itertools import combinations
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -72,10 +85,28 @@ def get_args():
     p.add_argument('--max_windows_per_record', default=None, type=int,
                    help='Cap windows per MIMIC record to reduce class imbalance skew')
     p.add_argument('--train_fraction', default=0.80, type=float,
-                   help='Only used in linear_probe mode')
+                   help='Only used in linear_probe mode (and only when '
+                        '--mimic_holdout_subjects_file is not given).')
+    p.add_argument('--mimic_holdout_subjects_file', type=str, default=None,
+                   help='Optional JSON listing MIMIC subject_ids to use as '
+                        'the linear_probe test cohort. Format matches '
+                        'sample_holdout output: {"case_ids": [...]}. '
+                        'Subject ids may be int or str; both are normalized.')
+    p.add_argument('--seed', type=int, default=42,
+                   help='Random seed for StratifiedGroupKFold and any '
+                        'reproducibility-sensitive split.')
     p.add_argument('--batch_size', default=256, type=int)
     p.add_argument('--tag', default='hetero', type=str)
     return p.parse_args()
+
+
+def _load_subject_ids(path: Optional[str]) -> Set[int]:
+    """Read a holdout JSON and coerce its ids to int (MIMIC subject_id)."""
+    if not path:
+        return set()
+    with open(path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+    return {int(c) for c in payload['case_ids']}
 
 
 def sensitivity_at_specificity(y_true, y_score, target_spec=0.90):
@@ -151,28 +182,23 @@ def main():
     print(header)
 
     if args.mode == 'zero_shot':
-        # No train split: extract all features, evaluate with a trivial "train = test" LR.
-        # This is valid only for ranking purposes; for the paper, report AUROC directly
-        # from the cosine-nearest-neighbor or kNN baseline instead.
-        # Here we simply use all samples as both train and test to report the embedding
-        # quality — OR leave train=test and report only AUROC of the linear fit.
-        #
-        # A cleaner zero-shot proxy: use 5-fold cross-validation within MIMIC subjects.
+        # 5-fold subject-level cross-validation within MIMIC. The encoder is
+        # frozen and never sees MIMIC during pretraining (VitalDB-only), so
+        # every fold's "test" is genuinely zero-shot for the encoder; only
+        # the LR head is refit per fold. shuffle=True + explicit random_state
+        # makes fold assignments reproducible across runs.
         from sklearn.model_selection import StratifiedGroupKFold
         from sklearn.metrics import roc_auc_score, average_precision_score
 
         subject_ids = np.array([s.subject_id for s in samples])
-        labels_all = np.array([s.label for s in samples])
-        unique_subjects = np.unique(subject_ids)
-        np.random.seed(42)
-        np.random.shuffle(unique_subjects)
 
         for subset in modal_subsets:
             subset_name = '+'.join(subset)
             all_x, all_y = extract_features(classifier, samples, subset, args.batch_size)
 
             # 5-fold subject-level CV
-            sgkf = StratifiedGroupKFold(n_splits=5)
+            sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True,
+                                        random_state=args.seed)
             aurocs, auprcs, sens90s = [], [], []
             for tr_idx, te_idx in sgkf.split(all_x, all_y, groups=subject_ids):
                 scaler = StandardScaler()
@@ -192,13 +218,28 @@ def main():
             print(row)
 
     else:  # linear_probe
-        # Subject-level 80/20 split.
+        # Subject-level split. Prefer external holdout JSON for full
+        # reproducibility; otherwise fall back to a sorted trailing slice
+        # by ``train_fraction``.
         unique_subjects = sorted(set(s.subject_id for s in samples))
-        n_train_s = int(len(unique_subjects) * args.train_fraction)
-        train_subjects = set(unique_subjects[:n_train_s])
-        train_samples = [s for s in samples if s.subject_id in train_subjects]
-        test_samples = [s for s in samples if s.subject_id not in train_subjects]
+        holdout_subjects = _load_subject_ids(args.mimic_holdout_subjects_file)
+        if holdout_subjects:
+            test_subjects = holdout_subjects & set(unique_subjects)
+            missing = holdout_subjects - test_subjects
+            if missing:
+                print(f'  [warn] {len(missing)} holdout subject_ids not '
+                      f'present in {args.mimic_npz_dir}.')
+        else:
+            n_train_s = int(len(unique_subjects) * args.train_fraction)
+            test_subjects = set(unique_subjects[n_train_s:])
+        train_samples = [s for s in samples if s.subject_id not in test_subjects]
+        test_samples = [s for s in samples if s.subject_id in test_subjects]
         print(f'  Train windows: {len(train_samples)}  Test: {len(test_samples)}')
+        if not test_samples:
+            raise RuntimeError(
+                'linear_probe mode produced an empty test set; check '
+                '--mimic_holdout_subjects_file or --train_fraction.'
+            )
 
         for subset in modal_subsets:
             subset_name = '+'.join(subset)

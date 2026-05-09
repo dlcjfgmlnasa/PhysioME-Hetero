@@ -4,18 +4,21 @@
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 
-# See physiome_hetero.yaml. Same value here.
+# See physiome_hetero.yaml. Same values here.
 holdout_subjects_file: null
-labeled_data_dir: '../../data/vitaldb'
 
-holdout_subject_size: 100
-test_size: 0.20
+# Dev-cohort linear probing (disjoint from holdout/test).
+probe_subjects_file: null
+probe_downstream_dir: null
+probe_every: 1
 
 modality_name2path:
   'ABP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ABP/model/best_model.pth'
   'ECG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ECG/model/best_model.pth'
   'PPG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/PPG/model/best_model.pth'
   'CVP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CVP/model/best_model.pth'
+  'CO2': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CO2/model/best_model.pth'
+  'AWP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/AWP/model/best_model.pth'
 
 sfreq: 100
 rfreq: 100
@@ -62,7 +65,7 @@ lora_dropout: 0.05
 restoration_only_on_complete: false
 
 # Probe efficiency knob — see physiome_hetero.yaml.
-probe_max_subsets: 10
+probe_max_subsets: 15
 
 print_point: 20
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero/ckpt/'

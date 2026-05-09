@@ -3,8 +3,8 @@ import os
 import sys
 sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
 
+import logging
 import mne
-import shutil
 import torch
 import yaml
 import random
@@ -14,7 +14,6 @@ import numpy as np
 import torch.optim as opt
 from models.utils import model_size
 from dataset.utils import group_cross_validation
-from torch.utils.tensorboard import SummaryWriter
 from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
 from models.physiome.model import PhysioME
 from pretrained.physiome.data_loader import TorchDataset
@@ -69,19 +68,31 @@ class Trainer(object):
         self.lr = self.args.train_base_learning_rate * self.eff_batch_size / 256
         self.optimizer = opt.AdamW(self.model.parameters(), lr=self.lr)
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.args.train_epochs)
-        self.tensorboard_path = os.path.join(self.args.ckpt_path, 'tensorboard')
         self.clipping_norm_value = 2.0
-
-        # remote tensorboard files
-        if os.path.exists(self.tensorboard_path):
-            shutil.rmtree(self.tensorboard_path)
-
-        self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
+        self.logger = self._build_logger()
 
         print('[PhysioME Parameter]')
         print('   >> Modal Names : {0}'.format(', '.join(self.ch_names)))
         print('   >> Model Size : {0:.2f}MB'.format(model_size(self.model)))
         print('   >> Leaning Rate : {0}'.format(self.lr))
+
+    def _build_logger(self):
+        log_dir = os.path.join(self.args.ckpt_path, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, 'train.log')
+
+        logger = logging.getLogger(f'physiome.{id(self)}')
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        logger.addHandler(fh)
+        return logger
 
     def train(self):
         train_dataset = TorchDataset(paths=self.train_paths, ch_names=self.ch_names,
@@ -129,19 +140,24 @@ class Trainer(object):
                                                            cross_contra_loss,
                                                            cross_contra_acc, loss))
 
-                self.tensorboard_writer.add_scalar('Inter Recon Loss', inter_recon_loss, total_step)
-                self.tensorboard_writer.add_scalar('Missing Recon Loss', missing_recon_loss, total_step)
-                self.tensorboard_writer.add_scalar('Cross Contra Loss', cross_contra_loss, total_step)
-                self.tensorboard_writer.add_scalar('Cross Contra Accuracy', cross_contra_acc, total_step)
-                self.tensorboard_writer.add_scalar('Total Loss', loss, total_step)
+                self.logger.info(
+                    'train step=%07d epoch=%03d '
+                    'inter_recon=%.6f missing_recon=%.6f '
+                    'cross_contra=%.6f cross_acc=%.4f total=%.6f',
+                    total_step, epoch,
+                    float(inter_recon_loss), float(missing_recon_loss),
+                    float(cross_contra_loss), float(cross_contra_acc), float(loss),
+                )
 
                 step += 1
                 total_step += 1
 
             acc, mf1 = self.linear_probing(epoch, val_dataloader, eval_dataloader)
 
-            self.tensorboard_writer.add_scalar('Validation Accuracy', acc, total_step)
-            self.tensorboard_writer.add_scalar('Validation Macro-F1', mf1, total_step)
+            self.logger.info(
+                'probe step=%07d epoch=%03d val_acc=%.4f val_macro_f1=%.4f',
+                total_step, epoch, float(acc), float(mf1),
+            )
 
             if mf1 > best_score:
                 best_score = mf1

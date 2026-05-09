@@ -377,7 +377,7 @@ if __name__ == '__main__':
     import tempfile
     from dataset.data_parser.vital_db_ssl import ShardWriter
 
-    MODAL = ['ABP', 'ECG', 'PPG', 'CVP']
+    MODAL = ['ABP', 'ECG', 'PPG', 'CVP', 'CO2', 'AWP']
     rng = np.random.default_rng(0)
 
     with tempfile.TemporaryDirectory() as tmp:

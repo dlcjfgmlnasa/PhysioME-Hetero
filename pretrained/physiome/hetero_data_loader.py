@@ -45,7 +45,12 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 
-MODAL_ORDER: List[str] = ['ABP', 'ECG', 'PPG', 'CVP']
+# Mirror dataset/data_parser/vital_db_ssl.MODAL_ORDER. The two MUST stay
+# in sync — the constructor's manifest check raises if the dataset on disk
+# was parsed with a different order. v2 (2026-05-09) is 6-modal:
+# cardiovascular trio (ABP/ECG/PPG) + sparse central-line (CVP) +
+# respiratory bundle (CO2/AWP).
+MODAL_ORDER: List[str] = ['ABP', 'ECG', 'PPG', 'CVP', 'CO2', 'AWP']
 NUM_MODALS: int = len(MODAL_ORDER)
 
 PRESENCE_REAL: int = 0

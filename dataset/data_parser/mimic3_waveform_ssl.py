@@ -7,11 +7,19 @@ and channel-name matching, but writes outputs in the hetero schema produced by
 ``vital_db_ssl.py`` so that downstream code (HeteroVitalDBDataset, BucketBatchSampler)
 works without modification.
 
+Modality coverage (Step 3, 2026-05-09): scans for 6 modalities (ABP/ECG/PPG/
+CVP/CO2/AWP) to match the v2 VitalDB cohort. Records that lack a candidate
+channel for a given modality simply leave that slot empty (subject_modality_set
+bit = False), which the multimodal model treats as naturally-absent at
+inference time. CO2/AWP are very rare in MIMIC-III WDB; this still parses
+the records cleanly and exercises the *"trained-on-N, infer-on-M<N"*
+hetero-availability story.
+
 Output (per record, one ``.npz`` in ``trg_path``):
-    x: float32 [T, 3, sfreq * duration]
-    mask: bool [T, 3]
-    modal_names: object [3]   — fixed ``['ABP', 'ECG', 'PPG']``
-    subject_modality_set: bool [3]
+    x: float32 [T, M, sfreq * duration]   — M = len(MODAL_ORDER), zero on absent slots
+    mask: bool [T, M]                       — per-segment, per-modality validity
+    modal_names: object [M]                 — fixed = MODAL_ORDER (from vital_db_ssl)
+    subject_modality_set: bool [M]
     case_id: str — record name (e.g., 'p000020-2183-04-28-17-47')
 
 Usage::
@@ -54,11 +62,19 @@ from dataset.data_parser.vital_db_ssl import (
 PN_DB = "mimic3wdb-matched/1.0"
 MIMIC3_NATIVE_SR: float = 125.0
 
-# Candidate channel names per modality (first match wins).
+# Candidate channel names per modality (first match wins). Names that exist
+# in MIMIC-III WDB Matched Subset header files; absent for a given record
+# simply means that modality is naturally-absent for that subject.
 MIMIC_CHANNEL_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     'ABP': ('ABP', 'ART'),
     'ECG': ('II', 'I', 'III', 'V', 'aVR', 'aVL', 'aVF', 'MCL1'),
     'PPG': ('PLETH',),
+    # Step 3 (2026-05-09): 6-modal scan to align with VitalDB v2 cohort.
+    # CVP/CO2/AWP are sparse in MIMIC-III WDB — most records will leave
+    # these slots empty, which the multimodal model handles natively.
+    'CVP': ('CVP', 'CVP1', 'CVP2'),
+    'CO2': ('CO2', 'EtCO2', 'PETCO2', 'ETCO2'),
+    'AWP': ('AWP', 'PAW', 'AWP1'),
 }
 
 
@@ -70,6 +86,9 @@ class MimicRecordInfo:
     abp_channel: str = ''
     ecg_channel: str = ''
     ppg_channel: str = ''
+    cvp_channel: str = ''
+    co2_channel: str = ''
+    awp_channel: str = ''
     n_segments: int = 1
 
 
@@ -133,13 +152,18 @@ def scan_records(max_records: int = 0,
                 abp_ch = _resolve_channel(sig_names, 'ABP')
                 ecg_ch = _resolve_channel(sig_names, 'ECG')
                 ppg_ch = _resolve_channel(sig_names, 'PPG')
+                cvp_ch = _resolve_channel(sig_names, 'CVP')
+                co2_ch = _resolve_channel(sig_names, 'CO2')
+                awp_ch = _resolve_channel(sig_names, 'AWP')
                 if require_abp and not abp_ch:
                     continue
-                if not (abp_ch or ecg_ch or ppg_ch):
+                if not (abp_ch or ecg_ch or ppg_ch
+                        or cvp_ch or co2_ch or awp_ch):
                     continue
                 found.append(MimicRecordInfo(
                     record_name=rec_name, pn_dir=pn_dir, patient_id=pid,
                     abp_channel=abp_ch, ecg_channel=ecg_ch, ppg_channel=ppg_ch,
+                    cvp_channel=cvp_ch, co2_channel=co2_ch, awp_channel=awp_ch,
                     n_segments=len(hdr.seg_name) if hasattr(hdr, 'seg_name') else 1,
                 ))
             except Exception:
@@ -211,6 +235,9 @@ def process_record(info: MimicRecordInfo,
         'ABP': info.abp_channel,
         'ECG': info.ecg_channel,
         'PPG': info.ppg_channel,
+        'CVP': info.cvp_channel,
+        'CO2': info.co2_channel,
+        'AWP': info.awp_channel,
     }
 
     try:
@@ -285,9 +312,16 @@ def parse_records_to_hetero(records: List[MimicRecordInfo],
             skipped += 1
             continue
         xs, masks = result
-        subject_modality_set = np.array([
-            bool(info.abp_channel), bool(info.ecg_channel), bool(info.ppg_channel),
-        ], dtype=bool)
+        # Order must match MODAL_ORDER exactly (xs is laid out in MODAL_ORDER).
+        channel_by_modal = {
+            'ABP': info.abp_channel, 'ECG': info.ecg_channel,
+            'PPG': info.ppg_channel, 'CVP': info.cvp_channel,
+            'CO2': info.co2_channel, 'AWP': info.awp_channel,
+        }
+        subject_modality_set = np.array(
+            [bool(channel_by_modal.get(m, '')) for m in MODAL_ORDER],
+            dtype=bool,
+        )
         np.savez(
             os.path.join(trg_path, info.record_name + '.npz'),
             x=xs, mask=masks,
@@ -301,7 +335,8 @@ def parse_records_to_hetero(records: List[MimicRecordInfo],
         saved += 1
 
     print(f'[MIMIC3-SSL] saved={saved}, skipped={skipped}')
-    print(f'[MIMIC3-SSL] bucket counts (ABP-ECG-PPG presence bitmap):')
+    print(f'[MIMIC3-SSL] bucket counts (bitmap = '
+          f'{"".join(MODAL_ORDER)}):')
     for k in sorted(bucket_counts.keys()):
         print(f'    {k}: {bucket_counts[k]}')
 

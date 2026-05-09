@@ -1,20 +1,19 @@
 # -*- coding:utf-8 -*-
-"""IOH (Intra-operative Hypotension) downstream evaluation.
+"""Hypoxemia downstream evaluation.
 
-Protocol:
+Protocol (mirrors run_ioh.py):
   1. Load VitalDB full-signal downstream npz (vital_db_downstream.py output)
-  2. Subject-level split driven by holdout JSON (= sample_holdout output):
+  2. Subject-level split driven by holdout JSON (sample_holdout output):
        test  = case_ids in --holdout_subjects_file
        train = remaining cases (optionally minus --dev_subjects_file)
-     This guarantees the downstream test cohort is exactly the cohort
-     excluded from SSL pretraining, eliminating leakage.
   3. Slide 60 s input windows with 5-min look-ahead horizon
-  4. Freeze PhysioME-Hetero encoder; extract latent for every 2^N-1 modal subset
-  5. Fit LogisticRegression; report AUROC, AUPRC, Sensitivity@Sp90% per subset
-  6. Print table and write results/<tag>_ioh.csv
+  4. Label = sustained SpO2 < 92% for ≥30 s within the horizon
+  5. Freeze PhysioME-Hetero encoder; extract latent for every 2^N-1 modal subset
+  6. Fit LogisticRegression; report AUROC, AUPRC, Sensitivity@Sp90% per subset
+  7. Print table and write results/<tag>_hypoxemia.csv
 
 Usage:
-  python downstream/run_ioh.py \\
+  python downstream/run_hypoxemia.py \\
       --ckpt_path  ckpt/vital_db/physiome_hetero/model/best_model.pth \\
       --data_dir   data/vitaldb_downstream \\
       --holdout_subjects_file data/vitaldb_ssl/holdout_case_ids.json \\
@@ -28,22 +27,22 @@ import os
 import sys
 import warnings
 from itertools import combinations
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (average_precision_score, roc_auc_score)
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
 warnings.filterwarnings('ignore')
 
-from downstream.tasks.hypotension import (
-    ForecastSample,
-    HypotensionDataset,
-    extract_forecast_samples,
+from downstream.tasks.hypoxemia import (
+    HypoxemiaDataset,
+    HypoxemiaSample,
+    extract_hypoxemia_samples,
     load_cases,
 )
 from downstream.utils import load_pretrained_to_classifier
@@ -60,8 +59,7 @@ def get_args():
                    help='Directory of vitaldb_downstream npz files')
     p.add_argument('--holdout_subjects_file', required=True, type=str,
                    help='JSON written by sample_holdout.py — defines the '
-                        'downstream test cohort (must equal the cohort '
-                        'excluded from SSL pretraining).')
+                        'downstream test cohort.')
     p.add_argument('--dev_subjects_file', type=str, default=None,
                    help='JSON of dev cohort (Phase-2 probe). Excluded from '
                         'BOTH train and test of this script if provided.')
@@ -69,18 +67,16 @@ def get_args():
     p.add_argument('--window_sec', default=60.0, type=float)
     p.add_argument('--stride_sec', default=60.0, type=float)
     p.add_argument('--horizon_sec', default=300.0, type=float)
-    p.add_argument('--map_threshold', default=65.0, type=float)
-    p.add_argument('--sustained_sec', default=60.0, type=float)
+    p.add_argument('--spo2_threshold', default=92.0, type=float)
+    p.add_argument('--sustained_sec', default=30.0, type=float)
     p.add_argument('--batch_size', default=256, type=int)
     p.add_argument('--tag', default='hetero', type=str,
                    help='Output file prefix (e.g. "hetero", "baseline")')
     p.add_argument('--save_preds', action='store_true',
                    help='Also save raw (y_true, y_score) npy for calibration analysis')
     p.add_argument('--max_subsets', type=int, default=0,
-                   help='Cap on number of modal subsets to evaluate (0 = all '
-                        '2^N-1). For 6-modal that is 63, often unnecessary; '
-                        'set e.g. 15 to evaluate full + each single-modal + '
-                        'random rest. Uses probe_utils.select_probe_subsets.')
+                   help='Cap on number of modal subsets to evaluate '
+                        '(0 = all 2^N-1).')
     return p.parse_args()
 
 
@@ -93,16 +89,13 @@ def _load_case_ids(path: Optional[str]) -> Set[str]:
     return {str(c) for c in payload['case_ids']}
 
 
-# ── Feature extraction ────────────────────────────────────────────
-
 def extract_features(
     model,
-    samples: List[ForecastSample],
+    samples: List[HypoxemiaSample],
     modal_subset: Tuple[str, ...],
     batch_size: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (X, y) feature matrix for a given modal subset."""
-    dataset = HypotensionDataset(samples, modal_order=list(modal_subset))
+    dataset = HypoxemiaDataset(samples, modal_order=list(modal_subset))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     all_x, all_y = [], []
     model.eval()
@@ -115,10 +108,7 @@ def extract_features(
     return np.concatenate(all_x, 0), np.concatenate(all_y, 0)
 
 
-# ── Metrics ──────────────────────────────────────────────────────
-
 def sensitivity_at_specificity(y_true, y_score, target_spec=0.90):
-    """Sensitivity at the threshold that achieves >= target specificity."""
     from sklearn.metrics import roc_curve
     fpr, tpr, _ = roc_curve(y_true, y_score)
     spec = 1 - fpr
@@ -127,8 +117,6 @@ def sensitivity_at_specificity(y_true, y_score, target_spec=0.90):
         return 0.0
     return float(tpr[mask].max())
 
-
-# ── Main ─────────────────────────────────────────────────────────
 
 def main():
     args = get_args()
@@ -145,9 +133,8 @@ def main():
         input_signals=list(MODAL_ORDER),
         min_duration_sec=600.0,
     )
-    print(f'  {len(all_cases)} valid cases')
+    print(f'  {len(all_cases)} valid cases (with SpO2 label)')
 
-    # Subject-level split driven by holdout JSON.
     holdout_ids = _load_case_ids(args.holdout_subjects_file)
     dev_ids = _load_case_ids(args.dev_subjects_file)
     overlap = holdout_ids & dev_ids
@@ -182,16 +169,15 @@ def main():
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
         horizon_sec=args.horizon_sec,
-        map_threshold=args.map_threshold,
+        spo2_threshold=args.spo2_threshold,
         sustained_sec=args.sustained_sec,
     )
-    train_samples = extract_forecast_samples(train_cases, **kw)
-    test_samples = extract_forecast_samples(test_cases, **kw)
-    pos_rate = np.mean([s.label for s in train_samples])
+    train_samples = extract_hypoxemia_samples(train_cases, **kw)
+    test_samples = extract_hypoxemia_samples(test_cases, **kw)
+    pos_rate = np.mean([s.label for s in train_samples]) if train_samples else 0.0
     print(f'  Train samples: {len(train_samples)}  positive rate: {pos_rate:.3f}')
     print(f'  Test  samples: {len(test_samples)}')
 
-    # Modal subsets — full enumeration unless --max_subsets is set.
     if args.max_subsets and args.max_subsets > 0:
         from pretrained.physiome.probe_utils import select_probe_subsets
         modal_subsets = select_probe_subsets(
@@ -231,10 +217,10 @@ def main():
         if args.save_preds:
             preds_dir = os.path.join(args.out_dir, 'preds')
             os.makedirs(preds_dir, exist_ok=True)
-            np.save(os.path.join(preds_dir, f'{args.tag}_ioh_{subset_name}_ytrue.npy'), test_y)
-            np.save(os.path.join(preds_dir, f'{args.tag}_ioh_{subset_name}_yscore.npy'), prob)
+            np.save(os.path.join(preds_dir, f'{args.tag}_hypoxemia_{subset_name}_ytrue.npy'), test_y)
+            np.save(os.path.join(preds_dir, f'{args.tag}_hypoxemia_{subset_name}_yscore.npy'), prob)
 
-    csv_path = os.path.join(args.out_dir, f'{args.tag}_ioh.csv')
+    csv_path = os.path.join(args.out_dir, f'{args.tag}_hypoxemia.csv')
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write(header + '\n')
         f.write('\n'.join(rows))

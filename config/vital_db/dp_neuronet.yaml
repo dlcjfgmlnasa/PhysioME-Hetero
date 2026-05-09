@@ -10,13 +10,23 @@ ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 # Set to null (or remove) to skip exclusion. CLI override: --holdout_subjects_file.
 holdout_subjects_file: null
 
+# Optional dev-cohort linear probing (disjoint from holdout/test). When both
+# probe_downstream_dir and probe_subjects_file are set, every probe_every
+# epochs the trainer extracts unimodal latents on the dev cohort, fits a
+# LogisticRegression on IOH labels, and logs AUROC + macro-F1.
+probe_downstream_dir: null               # vitaldb_downstream npz dir
+probe_subjects_file: null                # e.g. <ssl_data_dir>/dev_case_ids.json
+probe_every: 1                           # 1 = every epoch
+
 ch_names:
   - 'ABP'
   - 'ECG'
   - 'PPG'
   - 'CVP'
-# which channel index (0=ABP, 1=ECG, 2=PPG, 3=CVP) this run trains —
-# override on the command line per modality.
+  - 'CO2'
+  - 'AWP'
+# which channel index this run trains
+# (0=ABP, 1=ECG, 2=PPG, 3=CVP, 4=CO2, 5=AWP) — override on the CLI per modality.
 ch_idx: 2
 
 sfreq: 100

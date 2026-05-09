@@ -40,7 +40,7 @@ from downstream.tasks.hypotension import load_cases
 from downstream.utils import load_pretrained_to_classifier
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-MODAL_ORDER = ('ABP', 'ECG', 'PPG', 'CVP')
+MODAL_ORDER = ('ABP', 'ECG', 'PPG', 'CVP', 'CO2', 'AWP')
 
 
 def get_args():
@@ -58,6 +58,9 @@ def get_args():
     p.add_argument('--train_fraction', default=0.80, type=float)
     p.add_argument('--batch_size', default=256, type=int)
     p.add_argument('--tag', default='hetero', type=str)
+    p.add_argument('--max_subsets', type=int, default=0,
+                   help='Cap on number of modal subsets to evaluate '
+                        '(0 = all 2^N-1).')
     return p.parse_args()
 
 
@@ -123,10 +126,16 @@ def main():
     test_samples = extract_aki_samples(test_cases, **kw)
     print(f'  Train windows: {len(train_samples)}  Test windows: {len(test_samples)}')
 
-    modal_subsets = []
-    for r in range(1, len(MODAL_ORDER) + 1):
-        for combo in combinations(MODAL_ORDER, r):
-            modal_subsets.append(combo)
+    if args.max_subsets and args.max_subsets > 0:
+        from pretrained.physiome.probe_utils import select_probe_subsets
+        modal_subsets = select_probe_subsets(
+            list(MODAL_ORDER), max_subsets=args.max_subsets, seed=42,
+        )
+    else:
+        modal_subsets = []
+        for r in range(1, len(MODAL_ORDER) + 1):
+            for combo in combinations(MODAL_ORDER, r):
+                modal_subsets.append(combo)
 
     rows = []
     header = 'Subset,AUROC,AUPRC,Sens@Sp90'

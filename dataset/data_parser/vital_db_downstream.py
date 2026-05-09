@@ -11,13 +11,21 @@ Output (per case, one ``.npz`` in ``trg_path``):
     ecg: float32 [N]   — preprocessed ECG, ditto
     ppg: float32 [N]   — preprocessed PPG, ditto
     cvp: float32 [N]   — preprocessed CVP (central venous pressure), ditto
+    co2: float32 [N]   — preprocessed CO2 (capnography), ditto       (Step 3, 2026-05-09)
+    awp: float32 [N]   — preprocessed AWP (airway pressure), ditto   (Step 3, 2026-05-09)
+    spo2: float32 [N]  — pulse oximeter SpO2 (%) from Solar8000 monitor, label
+                         channel only (NOT in MODAL_ORDER); piecewise-constant
+                         resampling at sfreq Hz, NaN where invalid
     modality_present: bool [M]   — which of MODAL_ORDER exist in the recording
+    label_present: bool [L]      — which of LABEL_ORDER (currently just SPO2) exist
     sfreq: int
     case_id: str
 
 Modalities not recorded in the source case are not present in the npz at all
-(use ``modality_present`` to check before indexing). Modality keys / order are
-shared with ``vital_db_ssl.py`` via ``MODAL_ORDER`` / ``MODAL_TO_SIGNAL_KEY``.
+(use ``modality_present`` / ``label_present`` to check before indexing).
+Modality keys / order are shared with ``vital_db_ssl.py`` via ``MODAL_ORDER``
+/ ``MODAL_TO_SIGNAL_KEY`` — bumping the v2 set there propagates here for free.
+Label channels are intentionally separate so the model never sees them as inputs.
 """
 from __future__ import annotations
 
@@ -37,6 +45,16 @@ from dataset.data_parser.vital_db_ssl import (
     MODAL_TO_SIGNAL_KEY,
     MODAL_TRACK_NAMES,
 )
+
+
+# Label-only channels (NOT model inputs). Saved to npz so downstream tasks can
+# compute labels without re-reading the raw vital file.
+LABEL_TRACK_NAMES: Dict[str, str] = {
+    # Bedside monitor numeric SpO2 (%), ~1 Hz native; resampled piecewise-
+    # constant to sfreq Hz by vitaldb.vital_recs.
+    'SPO2': 'Solar8000/PLETH_SPO2',
+}
+LABEL_ORDER = ['SPO2']
 
 
 def get_args():
@@ -79,8 +97,12 @@ def vitaldb_downstream_converter(src_path: str, trg_path: str,
             skipped += 1
             continue
 
+        present_labels = [lbl for lbl, trk in LABEL_TRACK_NAMES.items()
+                          if trk in present_tracks]
+
         try:
-            tracks = [MODAL_TRACK_NAMES[m] for m in present_modals]
+            tracks = ([MODAL_TRACK_NAMES[m] for m in present_modals]
+                      + [LABEL_TRACK_NAMES[lbl] for lbl in present_labels])
             data = vitaldb.vital_recs(full_path, tracks, 1.0 / sfreq)
         except Exception:
             skipped += 1
@@ -101,12 +123,29 @@ def vitaldb_downstream_converter(src_path: str, trg_path: str,
                 )
             save_dict[m.lower()] = channel
 
+        # Label channels: no signal-domain preprocessing (these are monitor-
+        # derived numerics like SpO2 at 1 Hz; bandpass/notch would destroy
+        # them). Just clip to physiological range.
+        for j, lbl in enumerate(present_labels):
+            channel = np.asarray(data[:, len(present_modals) + j],
+                                 dtype=np.float32)
+            if lbl == 'SPO2':
+                channel = np.where(
+                    (channel < 50.0) | (channel > 100.0),
+                    np.nan, channel,
+                )
+            save_dict[lbl.lower()] = channel
+
         modality_present = np.array(
             [m in present_modals for m in MODAL_ORDER], dtype=bool,
+        )
+        label_present = np.array(
+            [lbl in present_labels for lbl in LABEL_ORDER], dtype=bool,
         )
         np.savez(
             os.path.join(trg_path, case_id + '.npz'),
             modality_present=modality_present,
+            label_present=label_present,
             sfreq=int(sfreq),
             case_id=case_id,
             **save_dict,

@@ -75,9 +75,9 @@ def main() -> None:
 
         # 2) sample holdout (deterministic seed)
         out_a = sample_holdout(tmp, n=5, seed=777,
-                               out_name='holdout_a.json', force=True)
+                               out_name='holdout_a.json', force=True)['holdout']
         out_b = sample_holdout(tmp, n=5, seed=777,
-                               out_name='holdout_b.json', force=True)
+                               out_name='holdout_b.json', force=True)['holdout']
         with open(out_a) as f:
             ha = json.load(f)
         with open(out_b) as f:
@@ -85,12 +85,26 @@ def main() -> None:
         assert ha['case_ids'] == hb['case_ids'], 'seeded holdout not deterministic'
         # Different seed -> different selection.
         out_c = sample_holdout(tmp, n=5, seed=1234,
-                               out_name='holdout_c.json', force=True)
+                               out_name='holdout_c.json', force=True)['holdout']
         with open(out_c) as f:
             hc = json.load(f)
         assert ha['case_ids'] != hc['case_ids'], 'different seed gave same selection'
         print(f'[smoke] sample_holdout deterministic / seed-sensitive ok '
               f'(holdout: {ha["case_ids"]})')
+
+        # 2b) holdout + dev cohort (disjoint)
+        paths = sample_holdout(tmp, n=5, n_dev=4, seed=777,
+                               out_name='holdout_d.json',
+                               dev_out_name='dev_d.json', force=True)
+        assert 'holdout' in paths and 'dev' in paths
+        with open(paths['holdout']) as f:
+            ho = json.load(f)
+        with open(paths['dev']) as f:
+            dv = json.load(f)
+        assert set(ho['case_ids']).isdisjoint(set(dv['case_ids'])), \
+            'holdout and dev cohorts must be disjoint'
+        print(f'[smoke] holdout+dev disjoint ok '
+              f'(|holdout|={len(ho["case_ids"])} |dev|={len(dv["case_ids"])})')
 
         # 3) Phase-1 dataset honours exclusion
         holdout = load_holdout_case_ids(out_a)

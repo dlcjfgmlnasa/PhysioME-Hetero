@@ -68,14 +68,21 @@ def _has_sustained_hypotension(future_maps: Sequence[float],
 
 
 def _load_case_npz(path: str) -> Optional[Dict[str, np.ndarray]]:
-    """Load one case-level npz produced by ``vital_db_downstream.py``."""
+    """Load one case-level npz produced by ``vital_db_downstream.py``.
+
+    Reads every modality channel that the npz happens to contain (v2 cohort:
+    abp/ecg/ppg/cvp/co2/awp). Channels not present in the recording are
+    simply omitted from ``signals`` — the caller (``load_cases``) decides
+    which combinations are usable.
+    """
+    candidate_modals = ('abp', 'ecg', 'ppg', 'cvp', 'co2', 'awp')
     with np.load(path, allow_pickle=True) as arr:
         modality_present = np.asarray(arr['modality_present'], dtype=bool)
-        # ABP is required for MAP-based labels.
+        # ABP is required for MAP-based labels (still true in v2).
         if not modality_present[0]:
             return None
         signals: Dict[str, np.ndarray] = {}
-        for m in ('abp', 'ecg', 'ppg'):
+        for m in candidate_modals:
             if m in arr.files:
                 signals[m] = np.asarray(arr[m], dtype=np.float32)
         sfreq = int(arr['sfreq'])

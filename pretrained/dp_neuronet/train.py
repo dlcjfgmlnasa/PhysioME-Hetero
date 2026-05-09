@@ -18,18 +18,22 @@ import sys
 sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
 
 import argparse
+import logging
 import random
-import shutil
 import warnings
+from typing import Tuple
 
 import mne
 import numpy as np
 import torch
 import torch.optim as opt
 import yaml
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
+from downstream.tasks.hypotension import HypotensionDataset
 from models.dp_neuronet.model import NeuroNet
 from models.utils import model_size
 from pretrained.dp_neuronet.hetero_data_loader import (
@@ -38,6 +42,7 @@ from pretrained.dp_neuronet.hetero_data_loader import (
     load_holdout_case_ids,
     split_shards,
 )
+from pretrained.probe_dev_data import load_dev_probe_split
 
 
 warnings.filterwarnings(action='ignore')
@@ -85,6 +90,17 @@ def get_args():
                         help='override holdout_subjects_file from yaml '
                              '(JSON written by sample_holdout). Excludes '
                              'those case_ids from Phase-1 SSL training.')
+    parser.add_argument('--probe_downstream_dir', type=str, default=None,
+                        help='vitaldb_downstream npz dir for IOH probing. '
+                             'If given together with --probe_subjects_file, '
+                             'enables periodic linear probing on the dev '
+                             'cohort to monitor learning progress.')
+    parser.add_argument('--probe_subjects_file', type=str, default=None,
+                        help='dev_case_ids.json used as the probe cohort. '
+                             'Must be disjoint from holdout_subjects_file '
+                             '(verify_split_disjoint.py I1).')
+    parser.add_argument('--probe_every', type=int, default=1,
+                        help='Run dev probing every N epochs (default 1).')
     return parser.parse_args()
 
 
@@ -128,11 +144,7 @@ class Trainer(object):
             eval_ratio=getattr(self.args, 'eval_shard_ratio', 0.1),
         )
 
-        self.tensorboard_path = os.path.join(self.args.ckpt_path, self.args.model_name,
-                                             self.modal_name, 'tensorboard')
-        if os.path.exists(self.tensorboard_path):
-            shutil.rmtree(self.tensorboard_path)
-        self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
+        self.logger = self._build_logger()
 
         print('[NeuroNet Parameter]')
         print('   >> Device     : {0}'.format(device))
@@ -158,6 +170,57 @@ class Trainer(object):
             print('   >> Eager   : True (workers={0})'.format(
                 int(getattr(self.args, 'eager_workers', 8) or 8)
             ))
+
+        # ── Dev-cohort linear probing (optional) ──────────────────
+        # Probing is only meaningful for modalities that hypotension.py
+        # actually loads from the downstream npz (ABP/ECG/PPG); CVP windows
+        # are not produced there, so we skip probing for that channel.
+        self.probe_train_loader = None
+        self.probe_eval_loader = None
+        probe_dir = getattr(self.args, 'probe_downstream_dir', None)
+        probe_subj = getattr(self.args, 'probe_subjects_file', None)
+        if probe_dir and probe_subj:
+            if self.modal_name.upper() not in {'ABP', 'ECG', 'PPG'}:
+                print(f'   >> Probe   : skipped (modal {self.modal_name} '
+                      f'not produced by vital_db_downstream.py)')
+            else:
+                print(f'   >> Probe   : dev cohort -> {probe_subj}')
+                tr_s, ev_s = load_dev_probe_split(
+                    downstream_dir=probe_dir,
+                    dev_subjects_file=probe_subj,
+                    input_signals=(self.modal_name,),
+                )
+                # Probing batches are small enough to leave on a single CPU
+                # worker — the LR fit dominates total probe time, not I/O.
+                self.probe_train_loader = DataLoader(
+                    HypotensionDataset(tr_s, modal_order=[self.modal_name]),
+                    batch_size=self.args.train_batch_size, shuffle=False,
+                )
+                self.probe_eval_loader = DataLoader(
+                    HypotensionDataset(ev_s, modal_order=[self.modal_name]),
+                    batch_size=self.args.train_batch_size, shuffle=False,
+                )
+                print(f'             samples: train={len(tr_s)} '
+                      f'eval={len(ev_s)}  probe_every={self.args.probe_every}')
+
+    def _build_logger(self) -> logging.Logger:
+        log_dir = os.path.join(self.args.ckpt_path, self.args.model_name,
+                               self.modal_name, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, 'train.log')
+
+        logger = logging.getLogger(f'dp_neuronet.{self.modal_name}.{id(self)}')
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        logger.addHandler(fh)
+        return logger
 
     def _build_loader(self, shard_indices, shuffle: bool, drop_last: bool) -> DataLoader:
         holdout = load_holdout_case_ids(
@@ -257,11 +320,13 @@ class Trainer(object):
                           '[Total] : {6:02.4f}'.format(
                             epoch, total_step + 1, recon_loss, l_t, l_f, l_tf, loss))
 
-                self.tensorboard_writer.add_scalar('Reconstruction Loss', recon_loss, total_step)
-                self.tensorboard_writer.add_scalar('L_T (time-time)', l_t, total_step)
-                self.tensorboard_writer.add_scalar('L_F (freq-freq)', l_f, total_step)
-                self.tensorboard_writer.add_scalar('L_TF (cross-domain)', l_tf, total_step)
-                self.tensorboard_writer.add_scalar('Total Loss', loss, total_step)
+                self.logger.info(
+                    'train step=%08d epoch=%03d '
+                    'recon=%.6f l_t=%.6f l_f=%.6f l_tf=%.6f total=%.6f',
+                    total_step, epoch,
+                    float(recon_loss), float(l_t), float(l_f),
+                    float(l_tf), float(loss),
+                )
 
                 step += 1
                 total_step += 1
@@ -275,12 +340,61 @@ class Trainer(object):
 
             print('[Epoch] : {0:03d} \t [Val Total] : {1:.4f} \t [Val Recon] : {2:.4f}\n'.format(
                 epoch, val_loss, val_recon))
-            self.tensorboard_writer.add_scalar('Val Total Loss', val_loss, total_step)
-            self.tensorboard_writer.add_scalar('Val Recon Loss', val_recon, total_step)
+            self.logger.info(
+                'val step=%08d epoch=%03d val_total=%.6f val_recon=%.6f',
+                total_step, epoch, float(val_loss), float(val_recon),
+            )
+
+            if self.probe_train_loader is not None \
+                    and (epoch + 1) % max(1, int(self.args.probe_every)) == 0:
+                auroc, mf1 = self._run_probe()
+                print('[Epoch] : {0:03d} \t [Probe AUROC] : {1:.4f} '
+                      '\t [Probe Macro-F1] : {2:.4f}\n'.format(epoch, auroc, mf1))
+                self.logger.info(
+                    'probe step=%08d epoch=%03d probe_auroc=%.4f probe_macro_f1=%.4f',
+                    total_step, epoch, auroc, mf1,
+                )
 
             self.scheduler.step()
 
         self.save_ckpt(model_state=best_model_state)
+
+    @torch.no_grad()
+    def _extract_probe_latents(self, loader: DataLoader):
+        """Forward dev probe samples through frozen backbone, return (X, y)."""
+        self.model.eval()
+        feats, labels = [], []
+        for data, y in loader:
+            x = data[self.modal_name].to(device).float()
+            z = self.model.forward_latent(x)
+            if z.dim() == 1:
+                z = z.unsqueeze(0)
+            feats.append(z.detach().cpu().numpy())
+            labels.append(y.numpy())
+        self.model.train()
+        if not feats:
+            return np.zeros((0, 1)), np.zeros((0,), dtype=np.int64)
+        return np.concatenate(feats, 0), np.concatenate(labels, 0)
+
+    def _run_probe(self) -> Tuple[float, float]:
+        """One LR-probe pass on the dev cohort. Returns (auroc, macro_f1)."""
+        tr_x, tr_y = self._extract_probe_latents(self.probe_train_loader)
+        ev_x, ev_y = self._extract_probe_latents(self.probe_eval_loader)
+        if len(tr_y) == 0 or len(ev_y) == 0 or len(set(tr_y)) < 2 \
+                or len(set(ev_y)) < 2:
+            # Degenerate probe (single class on either side) — skip metric.
+            return float('nan'), float('nan')
+        scaler = StandardScaler()
+        tr_x = scaler.fit_transform(tr_x)
+        ev_x = scaler.transform(ev_x)
+        clf = LogisticRegression(max_iter=1000, class_weight='balanced',
+                                 random_state=0)
+        clf.fit(tr_x, tr_y)
+        prob = clf.predict_proba(ev_x)[:, 1]
+        pred = clf.predict(ev_x)
+        auroc = float(roc_auc_score(ev_y, prob))
+        mf1 = float(f1_score(ev_y, pred, average='macro'))
+        return auroc, mf1
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader):
@@ -339,6 +453,9 @@ if __name__ == '__main__':
                                       'eager': cli.eager,
                                       'eager_workers': cli.eager_workers,
                                       'no_amp': cli.no_amp,
-                                      'holdout_subjects_file': cli.holdout_subjects_file})
+                                      'holdout_subjects_file': cli.holdout_subjects_file,
+                                      'probe_downstream_dir': cli.probe_downstream_dir,
+                                      'probe_subjects_file': cli.probe_subjects_file,
+                                      'probe_every': cli.probe_every})
     trainer = Trainer(augments)
     trainer.train()

@@ -12,9 +12,11 @@ Differences:
 * The :class:`PhysioME` forward receives a per-sample
   ``presence_state`` tensor and the ``restoration_only_on_complete`` toggle
   for ablation A3.
-* Per-epoch linear probing still runs on the IOH-labeled set
-  (``labeled_data_dir`` / original ``vital_db.py`` output) so that we have a
-  consistent supervised signal to track during pretraining.
+* Per-epoch linear probing runs on the *dev cohort* — case_ids listed in
+  ``probe_subjects_file`` (= dev_case_ids.json), windowed for the IOH task
+  via ``downstream/tasks/hypotension.py``. The dev cohort is disjoint from
+  both SSL training and the downstream test (= holdout) cohort, so probing
+  cannot leak into reported test metrics.
 
 Original ``train.py`` is preserved unchanged so that it can be re-used as the
 A1 ablation baseline (synthetic-only training on complete-modality data).
@@ -24,11 +26,11 @@ import sys
 sys.path.extend([os.path.abspath('.'), os.path.abspath('..')])
 
 import argparse
+import logging
 import random
-import shutil
 import warnings
 from collections import OrderedDict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import mne
 import numpy as np
@@ -38,13 +40,11 @@ import torch.optim as opt
 import yaml
 from models.transformer import apply_lora
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
-from dataset.utils import group_cross_validation
+from downstream.tasks.hypotension import HypotensionDataset
 from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
 from models.physiome.model import PhysioME
 from models.utils import model_size
-from pretrained.physiome.data_loader import TorchDataset as LabeledTorchDataset
 from pretrained.physiome.hetero_data_loader import (
     MODAL_ORDER,
     BucketBatchSampler,
@@ -54,6 +54,13 @@ from pretrained.physiome.hetero_data_loader import (
     load_holdout_case_ids,
 )
 from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
+from pretrained.probe_dev_data import load_dev_probe_split
+
+
+# vital_db_downstream.py only emits ABP/ECG/PPG; CVP is skipped at probe
+# time even when the model itself is 4-modal. The dropped channel is
+# transparently filled by ``inference_missing_modality``.
+PROBE_MODALITIES = ('ABP', 'ECG', 'PPG')
 
 
 warnings.filterwarnings(action='ignore')
@@ -94,9 +101,12 @@ class HeteroTrainer:
         find_ssl_data_dir(args.ssl_data_dir)  # raises with friendly message
         self.ssl_data_dir = args.ssl_data_dir
 
-        # Labeled probe paths (original IOH parser output, complete-modality)
-        self.labeled_train_paths, self.labeled_val_paths, self.labeled_eval_paths = \
-            self._labeled_paths()
+        # Probe cohort = dev_case_ids.json (disjoint from holdout/test).
+        # Loader construction is deferred to ``train()`` so that __init__
+        # remains side-effect-free w.r.t. the downstream npz dir.
+        self.probe_ch_names: List[str] = [
+            m for m in self.ch_names if m in PROBE_MODALITIES
+        ]
 
         self.model = PhysioME(
             backbone_networks=self._encoder_backbones(),
@@ -119,10 +129,7 @@ class HeteroTrainer:
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.train_epochs)
         self.clipping_norm_value = 2.0
 
-        self.tensorboard_path = os.path.join(self.args.ckpt_path, 'tensorboard')
-        if os.path.exists(self.tensorboard_path):
-            shutil.rmtree(self.tensorboard_path)
-        self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_path)
+        self.logger = self._build_logger()
 
         print('[PhysioME-Hetero parameters]')
         print(f'   >> Modal Names      : {", ".join(self.ch_names)}')
@@ -131,22 +138,58 @@ class HeteroTrainer:
         print(f'   >> SSL data dir     : {self.ssl_data_dir}')
         print(f'   >> Holdout subjects : '
               f'{getattr(self.args, "holdout_subjects_file", None) or "<none>"}')
-        print(f'   >> Labeled subjects : '
-              f'{len(self.labeled_train_paths)} train / '
-              f'{len(self.labeled_val_paths)} val / '
-              f'{len(self.labeled_eval_paths)} eval')
+        print(f'   >> Probe cohort     : '
+              f'{getattr(self.args, "probe_subjects_file", None) or "<none>"}')
+        print(f'   >> Probe modalities : {", ".join(self.probe_ch_names)}')
         print(f'   >> restoration_only_on_complete = {self.args.restoration_only_on_complete}')
 
     # ------------------------------------------------------------------
-    # Path setup
+    # Logger
     # ------------------------------------------------------------------
-    def _labeled_paths(self):
-        paths = group_cross_validation(
-            base_path=self.args.labeled_data_dir,
-            test_size=self.args.test_size,
-            holdout_subject_size=self.args.holdout_subject_size,
+    def _build_logger(self) -> logging.Logger:
+        log_dir = os.path.join(self.args.ckpt_path, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, 'train.log')
+
+        logger = logging.getLogger(f'physiome_hetero.{id(self)}')
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        logger.addHandler(fh)
+        return logger
+
+    # ------------------------------------------------------------------
+    # Probe loader setup (dev cohort, IOH labels)
+    # ------------------------------------------------------------------
+    def _build_probe_loaders(self) -> Tuple[Optional[DataLoader],
+                                            Optional[DataLoader]]:
+        probe_dir = getattr(self.args, 'probe_downstream_dir', None)
+        probe_subj = getattr(self.args, 'probe_subjects_file', None)
+        if not (probe_dir and probe_subj):
+            print('[probe] disabled — set probe_downstream_dir + '
+                  'probe_subjects_file in yaml to enable.')
+            return None, None
+        train_s, eval_s = load_dev_probe_split(
+            downstream_dir=probe_dir,
+            dev_subjects_file=probe_subj,
+            input_signals=tuple(self.probe_ch_names),
         )
-        return paths['train_paths'], paths['val_paths'], paths['eval_paths']
+        train_loader = DataLoader(
+            HypotensionDataset(train_s, modal_order=self.probe_ch_names),
+            batch_size=self.args.train_batch_size, shuffle=False,
+        )
+        eval_loader = DataLoader(
+            HypotensionDataset(eval_s, modal_order=self.probe_ch_names),
+            batch_size=self.args.train_batch_size, shuffle=False,
+        )
+        print(f'[probe] dev samples: train={len(train_s)} eval={len(eval_s)}')
+        return train_loader, eval_loader
 
     # ------------------------------------------------------------------
     # Encoder backbones (LoRA-wrapped NeuroNet encoders, same as train.py)
@@ -227,19 +270,9 @@ class HeteroTrainer:
         print(f'[BucketBatchSampler] active buckets: {sorted(sampler.buckets.keys())} '
               f'sizes={[len(sampler.buckets[k]) for k in sorted(sampler.buckets.keys())]}')
 
-        # Labeled probe data — complete-modality, IOH-labeled
-        val_dataset = LabeledTorchDataset(
-            paths=self.labeled_val_paths, ch_names=self.ch_names,
-            sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-            scaler=self.args.data_scaler, downsampling=self.args.class_downsampling,
-        )
-        val_dataloader = DataLoader(val_dataset, batch_size=self.args.train_batch_size)
-        eval_dataset = LabeledTorchDataset(
-            paths=self.labeled_eval_paths, ch_names=self.ch_names,
-            sfreq=self.args.sfreq, rfreq=self.args.rfreq,
-            scaler=self.args.data_scaler,
-        )
-        eval_dataloader = DataLoader(eval_dataset, batch_size=self.args.train_batch_size)
+        # Dev-cohort probe data (IOH labels, ABP/ECG/PPG only).
+        val_dataloader, eval_dataloader = self._build_probe_loaders()
+        probe_every = max(1, int(getattr(self.args, 'probe_every', 1)))
 
         total_step = 0
         best_state, best_score = self.model.state_dict(), 0.0
@@ -274,24 +307,30 @@ class HeteroTrainer:
                           f'[Contra] : {cross_contra:2.4f}  [Acc] : {cross_acc:2.3f}  '
                           f'[Total] : {loss:2.3f}')
 
-                self.tensorboard_writer.add_scalar('Inter Recon Loss', inter_recon, total_step)
-                self.tensorboard_writer.add_scalar('Missing Recon Loss', missing_recon, total_step)
-                self.tensorboard_writer.add_scalar('Cross Contra Loss', cross_contra, total_step)
-                self.tensorboard_writer.add_scalar('Cross Contra Accuracy', cross_acc, total_step)
-                self.tensorboard_writer.add_scalar('Total Loss', loss, total_step)
-                self.tensorboard_writer.add_text(
-                    'Bucket Pattern', batch['bucket_pattern'], total_step,
+                self.logger.info(
+                    'train step=%07d epoch=%03d bucket=%s '
+                    'inter_recon=%.6f missing_recon=%.6f '
+                    'cross_contra=%.6f cross_acc=%.4f total=%.6f',
+                    total_step, epoch, batch['bucket_pattern'],
+                    float(inter_recon), float(missing_recon),
+                    float(cross_contra), float(cross_acc), float(loss),
                 )
 
                 step += 1
                 total_step += 1
 
-            acc, mf1 = self.linear_probing(epoch, val_dataloader, eval_dataloader)
-            self.tensorboard_writer.add_scalar('Validation Accuracy', acc, total_step)
-            self.tensorboard_writer.add_scalar('Validation Macro-F1', mf1, total_step)
-
-            if mf1 > best_score:
-                best_score = mf1
+            if val_dataloader is not None and eval_dataloader is not None \
+                    and (epoch + 1) % probe_every == 0:
+                acc, mf1 = self.linear_probing(epoch, val_dataloader, eval_dataloader)
+                self.logger.info(
+                    'probe step=%07d epoch=%03d val_acc=%.4f val_macro_f1=%.4f',
+                    total_step, epoch, float(acc), float(mf1),
+                )
+                if mf1 > best_score:
+                    best_score = mf1
+                    best_state = self.model.state_dict()
+            else:
+                # Probe disabled — keep latest state as best.
                 best_state = self.model.state_dict()
 
             self.scheduler.step()
@@ -304,18 +343,17 @@ class HeteroTrainer:
     def linear_probing(self, epoch: int, val_dataloader: DataLoader,
                        eval_dataloader: DataLoader) -> Tuple[float, float]:
         """Probe the frozen encoder via Logistic Regression on a sampled
-        subset of the ``2^N - 1`` modality combinations.
+        subset of the modality combinations available in the dev probe set.
 
-        See ``probe_utils`` for the sampling rule (always include the full
-        set + every single-modal subset, then random-sample up to
-        ``probe_max_subsets``). This keeps probe runtime bounded even at
-        N=4/5 while preserving the corner-case coverage that matters for
-        hetero ablations.
+        Subsets are drawn from ``self.probe_ch_names`` (= ABP/ECG/PPG) since
+        ``vital_db_downstream.py`` does not emit CVP windows. The 4-modal
+        case is still represented at inference time via
+        ``inference_missing_modality`` filling in CVP with the dropped token.
         """
         self.model.eval()
         max_subsets = int(getattr(self.args, 'probe_max_subsets', 10))
         subsets = select_probe_subsets(
-            self.ch_names, max_subsets=max_subsets, seed=epoch,
+            self.probe_ch_names, max_subsets=max_subsets, seed=epoch,
         )
 
         train_fn = lambda subset: self._latent_vector(subset, val_dataloader)
@@ -332,17 +370,21 @@ class HeteroTrainer:
         self.model.eval()
         total_x, total_y = [], []
         with torch.no_grad():
-            for x, y in dataloader:
-                # ``x`` shape from LabeledTorchDataset: [B, num_total_modals, T]
-                # in MODAL_ORDER order.
+            for data_dict, y in dataloader:
+                # HypotensionDataset yields {modal_name: [B, T] tensor}.
+                # Drop modalities not in this subset; keep only requested ones.
                 data = {
-                    ch_name: x[:, self.ch_names.index(ch_name), :].squeeze().float().to(device)
-                    for ch_name in modal_combination
+                    ch_name: data_dict[ch_name].to(device).float()
+                    for ch_name in modal_combination if ch_name in data_dict
                 }
+                if not data:
+                    continue
                 latent = self.model.inference_missing_modality(data=data)
                 total_x.append(latent.detach().cpu().numpy())
                 total_y.append(y.detach().cpu().numpy())
         self.model.train()
+        if not total_x:
+            return np.zeros((0, 1)), np.zeros((0,), dtype=np.int64)
         return np.concatenate(total_x, 0), np.concatenate(total_y, 0)
 
     # ------------------------------------------------------------------
@@ -385,10 +427,13 @@ class HeteroTrainer:
             'model_state': model_state,
             'hyperparameter': self.args.__dict__,
             'paths': {
-                'ssl_train_paths': self.ssl_train_paths,
-                'labeled_train_paths': self.labeled_train_paths,
-                'labeled_val_paths': self.labeled_val_paths,
-                'labeled_eval_paths': self.labeled_eval_paths,
+                'ssl_data_dir': self.ssl_data_dir,
+                'holdout_subjects_file': getattr(
+                    self.args, 'holdout_subjects_file', None),
+                'probe_subjects_file': getattr(
+                    self.args, 'probe_subjects_file', None),
+                'probe_downstream_dir': getattr(
+                    self.args, 'probe_downstream_dir', None),
             },
         }, os.path.join(ckpt_path, 'best_model.pth'))
 

@@ -1,8 +1,8 @@
 # PhysioME-Hetero pretraining config for VitalDB.
 # Reads SSL pretraining data from ``ssl_data_dir`` (output of
-# dataset/data_parser/vital_db_ssl.py) and labeled IOH data from
-# ``labeled_data_dir`` (output of dataset/data_parser/vital_db.py) for
-# per-epoch linear-probe validation.
+# dataset/data_parser/vital_db_ssl.py) and runs per-epoch linear probing
+# on the dev cohort (case_ids in ``probe_subjects_file``) windowed via
+# ``downstream/tasks/hypotension.py`` for the IOH task.
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 
@@ -11,22 +11,27 @@ ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
 # subjects leak across stages. See dataset/data_parser/{build_case_index,
 # sample_holdout}.py.
 holdout_subjects_file: null
-labeled_data_dir: '../../data/vitaldb'
 
-# Subject split for SSL pretraining and labeled probing.
-# (group_cross_validation is called separately on each base_path.)
-holdout_subject_size: 100
-test_size: 0.20
+# Dev-cohort linear probing (disjoint from holdout/test). Set both to a
+# valid path to enable per-epoch probing; leave null to skip.
+probe_subjects_file: null                # e.g. <ssl_data_dir>/dev_case_ids.json
+probe_downstream_dir: null               # vitaldb_downstream npz dir
+probe_every: 1                           # run probe every N epochs
 
 # Backbone unimodal checkpoints (same as the original physiome.yaml).
-# 4-modal hetero (Step 2, 2026-05-05): CVP added — bucket count 7 -> 15.
-# CVP is sparse (~25% of cases, CV catheter is invasive / major surgery only),
-# which is the paper's headline hetero-availability signal.
+# 6-modal hetero (Step 3, 2026-05-09): + CO2 (capnography, ~80% prevalence)
+# and + AWP (airway pressure, ~50%) round out the cardio-pulmonary modality
+# set. Theoretical bucket count rises to 63, but realistic active buckets
+# are far fewer (~8) because availability follows clinical phenotype
+# (anesthesia / mechanical-ventilation / central-line) rather than uniform
+# random.
 modality_name2path:
   'ABP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ABP/model/best_model.pth'
   'ECG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ECG/model/best_model.pth'
   'PPG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/PPG/model/best_model.pth'
   'CVP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CVP/model/best_model.pth'
+  'CO2': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CO2/model/best_model.pth'
+  'AWP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/AWP/model/best_model.pth'
 
 # Signal config.
 sfreq: 100
@@ -82,10 +87,12 @@ lora_dropout: 0.05
 #          via dropped_modality_token but contribute zero loss.
 restoration_only_on_complete: true
 
-# Probe efficiency knob (probe_utils.select_probe_subsets). N=4 -> 15
-# subsets, capped to 10 per epoch with full-set + each single-modal
-# always included.
-probe_max_subsets: 10
+# Probe efficiency knob (probe_utils.select_probe_subsets). N=6 -> 63
+# subsets, capped per epoch with full-set + each single-modal always
+# included. Probe runs only on modalities the downstream npz can produce
+# (= probe_modalities in train_hetero.PROBE_MODALITIES, currently
+# ABP/ECG/PPG), so the practical subset count is bounded by 2^3-1 = 7.
+probe_max_subsets: 15
 
 print_point: 20
 # Phase-2 ckpt root (same parent as Phase-1; model_name keeps them separate).

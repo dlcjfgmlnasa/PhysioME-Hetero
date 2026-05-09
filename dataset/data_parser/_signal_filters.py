@@ -4,9 +4,10 @@ Ported from references/Biosignal-Foundation-Model/data/parser/vitaldb.py
 (2026-05-04), keeping the configurations the upstream project arrived at after
 empirical tuning.
 
-The full ``SIGNAL_CONFIGS`` table covers 8 signal types — we only use ABP/ECG/PPG
-in PhysioME-Hetero v1, but keeping the full table makes future modality
-extensions a one-line change.
+The full ``SIGNAL_CONFIGS`` table covers 8 signal types. PhysioME-Hetero v2
+uses 6 of them: ABP / ECG / PPG (cardiovascular), CVP (sparse central-line),
+CO2 / AWP (respiratory). PAP / ICP remain available for sparse-modality
+sub-experiments.
 """
 from __future__ import annotations
 

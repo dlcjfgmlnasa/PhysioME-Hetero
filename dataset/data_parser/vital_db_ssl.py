@@ -72,13 +72,24 @@ MODAL_TRACK_NAMES: Dict[str, str] = {
     # catheter is invasive; major surgery only) — that sparsity is the
     # paper's main hetero-availability signal.
     'CVP': 'SNUADC/CVP',
+    # Step 3 (2026-05-09): 6-modal expansion — respiratory bundle.
+    # CO2 (capnography) — gas-exchange marker, available in most anesthesia
+    # cases (~80% prevalence); Primus/CO2 is end-tidal CO2 from the GE Primus
+    # ventilator/anesthesia workstation, sampled at 62.5Hz natively.
+    # AWP (airway pressure) — lung mechanics marker, available in mechanical-
+    # ventilation cases (~50% prevalence); Primus/AWP from the same source.
+    # Together with CVP these define the v2 "cardio-pulmonary" foundation
+    # modality set; respiratory pair complements the cardiovascular ABP/ECG/PPG
+    # trio with directly-measured ventilation signals.
+    'CO2': 'Primus/CO2',
+    'AWP': 'Primus/AWP',
 }
 # short-name → key used by SIGNAL_CONFIGS / domain_quality_check
 MODAL_TO_SIGNAL_KEY: Dict[str, str] = {
     'ABP': 'abp', 'ECG': 'ecg', 'PPG': 'ppg',
-    'CVP': 'cvp',
+    'CVP': 'cvp', 'CO2': 'co2', 'AWP': 'awp',
 }
-MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CVP']
+MODAL_ORDER = ['ABP', 'ECG', 'PPG', 'CVP', 'CO2', 'AWP']
 
 MANIFEST_NAME = 'manifest.json'
 MANIFEST_VERSION = 1
