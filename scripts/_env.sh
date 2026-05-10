@@ -43,6 +43,14 @@ export HOLDOUT_JSON DEV_JSON
 : "${NUM_WORKERS:=16}"
 : "${PREFETCH_FACTOR:=4}"
 : "${SHARD_CACHE_SIZE:=2}"
+# EAGER=1 pre-loads every (modality, kept-segment) slice into RAM at
+# init (one parallel shard sweep). Eliminates per-batch network I/O at
+# the cost of ~13-20 GB RAM per Phase-1 modality. Strongly recommended
+# on slow / network filesystems (e.g. KHDP /home/coder/workspace NFS).
+# Two modalities run in parallel under PHASE1_PARALLEL=2, so plan for
+# ~30-40 GB peak RAM.
+: "${EAGER:=0}"
+: "${EAGER_WORKERS:=8}"
 
 # ── GPU layout ──────────────────────────────────────────────────────
 # How many GPUs to parallelise Phase-1 across (1 = sequential, 2 = pair).

@@ -14,7 +14,11 @@ train_one() {
     local gpu="$2"
     local name="${CH_NAMES[$idx]}"
     local out="$LOG_DIR/02_phase1_${name}.log"
-    log "▶ START phase1[$name] (idx=$idx gpu=$gpu) → $out"
+    log "▶ START phase1[$name] (idx=$idx gpu=$gpu eager=$EAGER) → $out"
+    local eager_args=()
+    if [[ "$EAGER" == "1" ]]; then
+        eager_args+=(--eager --eager_workers "$EAGER_WORKERS")
+    fi
     CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dp_neuronet.train \
         --config_yaml config/vital_db/dp_neuronet.yaml \
         --ch_idx "$idx" \
@@ -27,6 +31,7 @@ train_one() {
         --probe_downstream_dir  "$DS_DIR" \
         --probe_subjects_file   "$DEV_JSON" \
         --probe_every 1 \
+        "${eager_args[@]}" \
         > "$out" 2>&1
     local rc=$?
     if [[ $rc -eq 0 ]]; then
