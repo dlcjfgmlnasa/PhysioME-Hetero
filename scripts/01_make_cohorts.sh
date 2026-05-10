@@ -4,10 +4,13 @@
 source "$(dirname "$0")/_env.sh"
 print_env
 
-# 1) per-shard case index sidecar (~100 min on slow NFS)
+# 1) per-shard case index sidecar (~100 min on slow NFS).
+#    --force makes this step idempotent: rerunning the script doesn't
+#    crash on an existing case_index.json (the manifest is the source of
+#    truth either way).
 run_step "01a_build_case_index" \
     python -m dataset.data_parser.build_case_index \
-        --data_dir "$SSL_DIR"
+        --data_dir "$SSL_DIR" --force
 
 # 2) sample disjoint cohorts (CVP-stratified, downstream-eligible).
 #    --downstream_dir restricts the pool to ABP-bearing cases so that every
