@@ -38,16 +38,80 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from downstream.tasks.hypotension import (
     ForecastSample,
+    _load_case_npz as _load_case_npz_iohlike,
     extract_forecast_samples,
-    load_cases,
 )
 from downstream.tasks.modality_forecast import (
     ForecastTaskConfig,
     ModalityForecastSample,
     TASK_PRESETS,
+    _load_case_npz as _load_case_npz_modality,
     extract_modality_samples,
-    load_cases_modality,
 )
+
+
+def _read_dev_cases_iohlike(downstream_dir: str, dev_ids: Set[str],
+                            min_duration_sec: float,
+                            input_signals: Sequence[str]) -> List[dict]:
+    """Direct npz read for the dev cohort, IOH-style (ABP+ECG+PPG channels).
+
+    Bypasses ``hypotension.load_cases``'s ``glob.glob`` over the whole
+    downstream_dir so that probe initialisation does not list every file
+    on the (often slow) NFS share. Reads only ``<dev_id>.npz`` for the
+    50-ish dev subjects.
+    """
+    required = set(s.lower() for s in input_signals) | {'abp'}
+    cases: List[dict] = []
+    missing = 0
+    for cid in sorted(dev_ids):
+        p = os.path.join(downstream_dir, f'{cid}.npz')
+        if not os.path.isfile(p):
+            missing += 1
+            continue
+        loaded = _load_case_npz_iohlike(p)
+        if loaded is None:
+            continue
+        signals = loaded['signals']
+        if not required.issubset(signals.keys()):
+            continue
+        min_len = min(s.shape[0] for s in signals.values())
+        sfreq = loaded['sfreq']
+        if min_len < int(min_duration_sec * sfreq):
+            continue
+        signals = {k: v[:min_len] for k, v in signals.items()}
+        cases.append({'case_id': loaded['case_id'], 'signals': signals,
+                      'sfreq': sfreq})
+    if missing:
+        print(f'  [probe_dev_data] {missing}/{len(dev_ids)} dev npz '
+              f'not found on disk — proceeding with {len(cases)} cases')
+    return cases
+
+
+def _read_dev_cases_modality(downstream_dir: str, dev_ids: Set[str],
+                             task: ForecastTaskConfig,
+                             min_duration_sec: float) -> List[dict]:
+    """Direct npz read for the dev cohort, single-modality forecast tasks."""
+    cases: List[dict] = []
+    missing = 0
+    for cid in sorted(dev_ids):
+        p = os.path.join(downstream_dir, f'{cid}.npz')
+        if not os.path.isfile(p):
+            missing += 1
+            continue
+        loaded = _load_case_npz_modality(p, task.signal_key)
+        if loaded is None:
+            continue
+        sig = loaded['signals'][task.signal_key]
+        if sig.shape[0] < int(min_duration_sec * loaded['sfreq']):
+            continue
+        cases.append({'case_id': loaded['case_id'],
+                      'signals': {task.signal_key: sig},
+                      'sfreq': loaded['sfreq']})
+    if missing:
+        print(f'  [probe_dev_data] {missing}/{len(dev_ids)} dev npz '
+              f'not found on disk for task {task.modal_name} — '
+              f'proceeding with {len(cases)} cases')
+    return cases
 
 
 # Per-Phase-1 modality, the probe task that is *both* (a) computable from the
@@ -99,12 +163,12 @@ def load_dev_probe_split(
 
     dev_ids = _load_subject_ids(dev_subjects_file)
 
-    all_cases = load_cases(
-        data_dir=downstream_dir,
-        input_signals=list(input_signals),
+    dev_cases = _read_dev_cases_iohlike(
+        downstream_dir=downstream_dir,
+        dev_ids=dev_ids,
         min_duration_sec=min_duration_sec,
+        input_signals=input_signals,
     )
-    dev_cases = [c for c in all_cases if str(c['case_id']) in dev_ids]
     if not dev_cases:
         raise RuntimeError(
             f'No dev cases found in {downstream_dir!r} matching '
@@ -164,12 +228,12 @@ def load_dev_probe_modality_split(
 
     dev_ids = _load_subject_ids(dev_subjects_file)
 
-    all_cases = load_cases_modality(
-        data_dir=downstream_dir,
+    dev_cases = _read_dev_cases_modality(
+        downstream_dir=downstream_dir,
+        dev_ids=dev_ids,
         task=task,
         min_duration_sec=min_duration_sec,
     )
-    dev_cases = [c for c in all_cases if str(c['case_id']) in dev_ids]
     if not dev_cases:
         raise RuntimeError(
             f'No dev cases found in {downstream_dir!r} matching '
