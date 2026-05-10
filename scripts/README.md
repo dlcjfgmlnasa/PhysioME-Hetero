@@ -12,7 +12,7 @@ to chain them.
 | `_env.sh`            | (sourced) shared env vars + helpers     | — |
 | `00_parse_data.sh`   | VitalDB → SSL shards + downstream npz   | ~9 h (1×) |
 | `01_make_cohorts.sh` | case_index + holdout/dev cohorts + verify | ~110 min (1×) |
-| `02_phase1.sh`       | Phase-1 unimodal SSL × 6                | ~18 h (2-GPU) |
+| `02_phase1.sh`       | Phase-1 unimodal SSL × 6                | ~36 h (1-GPU sequential, default) / ~18 h (2-GPU, set `PHASE1_PARALLEL=2`) |
 | `03_phase2.sh`       | Phase-2 PhysioME-Hetero multimodal SSL  | ~12-18 h |
 | `04_downstream.sh`   | IOH + Hypoxemia + AKI + A2 ablation     | ~30 min × 4 |
 | `05_external.sh`     | MIMIC-III mortality (zero-shot + LP)    | ~1 h |
@@ -54,7 +54,9 @@ re-runs only Phase-2 → downstream → external.
 | `HOLDOUT_N`       | 100 | downstream test cohort size |
 | `DEV_N`           | 50  | per-epoch probe cohort size |
 | `COHORT_SEED`     | 777 | reproducible cohort split |
-| `PHASE1_PARALLEL` | 2   | 1 = sequential, 2 = pair on cuda:0 + cuda:1 |
+| `PHASE1_PARALLEL` | 1   | 1 = sequential (safe default; avoids OOM on shared GPUs), 2 = pair on cuda:0 + cuda:1 (needs ~24 GB free / GPU + ≥60 GB RAM) |
+| `EAGER`           | 0   | 1 = pre-load shards into RAM (~13-20 GB / modality, ~5-10× faster epochs on NFS) |
+| `EAGER_WORKERS`   | 8   | parallel sweep workers when EAGER=1 |
 | `MAX_SUBSETS`     | 15  | downstream subset cap (0 = enumerate all 63) |
 | `NUM_WORKERS`     | 16  | DataLoader workers |
 | `PREFETCH_FACTOR` | 4   | DataLoader prefetch (Phase-1) |

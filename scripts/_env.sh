@@ -54,7 +54,11 @@ export HOLDOUT_JSON DEV_JSON
 
 # ── GPU layout ──────────────────────────────────────────────────────
 # How many GPUs to parallelise Phase-1 across (1 = sequential, 2 = pair).
-: "${PHASE1_PARALLEL:=2}"
+# Default 1 because 2-GPU pair commonly OOMs on shared L40S nodes when
+# the second modality's eager cache + GPU memory collide. Set
+# PHASE1_PARALLEL=2 explicitly only when nvidia-smi confirms ~24 GB
+# free per GPU AND host RAM ≥ 60 GB.
+: "${PHASE1_PARALLEL:=1}"
 
 # ── Downstream knobs ────────────────────────────────────────────────
 # 0 = enumerate every 2^N-1 modal subset (63 at N=6, slow).
