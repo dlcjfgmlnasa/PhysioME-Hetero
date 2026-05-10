@@ -7,7 +7,12 @@ print_env
 CH_NAMES=(ABP ECG PPG CVP CO2 AWP)
 
 train_one() {
-    local idx="$1" gpu="$2" name="${CH_NAMES[$idx]}"
+    # NOTE: split across lines because `set -u` evaluates ${CH_NAMES[$idx]}
+    # in the same `local` statement *before* idx itself is bound — the
+    # one-liner version raises "unbound variable: idx".
+    local idx="$1"
+    local gpu="$2"
+    local name="${CH_NAMES[$idx]}"
     local out="$LOG_DIR/02_phase1_${name}.log"
     log "▶ START phase1[$name] (idx=$idx gpu=$gpu) → $out"
     CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dp_neuronet.train \
