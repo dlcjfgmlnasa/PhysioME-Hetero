@@ -126,17 +126,36 @@ def main() -> int:
             'I2: every holdout case_id is in downstream_dir',
             not missing,
             detail=(f'{len(missing)} missing (e.g. '
-                    f'{sorted(missing)[:5]})' if missing else
+                    f'{sorted(missing)[:5]}) — '
+                    'sample_holdout was probably run without --downstream_dir; '
+                    're-run with that flag to constrain the pool.'
+                    if missing else
                     f'all {len(holdout)} holdout ids present '
                     f'(of {len(ds_ids)} downstream cases)'),
         )
-        leaked = (ds_ids - holdout) & dev if dev else set()
-        all_ok &= _check(
-            'I2b: dev cohort not present in downstream_dir as test',
-            not leaked,
-            detail=(f'{len(leaked)} dev ids leaked into downstream'
-                    if leaked else 'dev disjoint from downstream test'),
-        )
+        # I2b — dev cohort SHOULD be in downstream_dir so that probing
+        # can extract windows from those cases. (The previous version of
+        # this check inverted the intent and always failed when the dev
+        # cohort had any downstream coverage at all.) The actual leakage
+        # invariant — "dev never appears in the downstream *test* split"
+        # — is enforced statically by run_*.py's --dev_subjects_file flag,
+        # not by this verifier.
+        if dev:
+            dev_in_ds = dev & ds_ids
+            coverage = len(dev_in_ds) / max(len(dev), 1)
+            ok = coverage >= 0.5
+            all_ok &= _check(
+                'I2b: dev has enough downstream coverage for probing',
+                ok,
+                detail=(f'{len(dev_in_ds)}/{len(dev)} dev ids present in '
+                        f'downstream ({coverage:.0%}) — probing will see '
+                        f'{len(dev_in_ds)} subjects'
+                        if ok else
+                        f'only {len(dev_in_ds)}/{len(dev)} dev ids present '
+                        f'in downstream ({coverage:.0%}); probe sample size '
+                        'will be too small. Re-run sample_holdout with '
+                        '--downstream_dir or increase --n_dev.'),
+            )
 
     # I3 — SSL universe sanity
     if args.ssl_dir:

@@ -9,11 +9,16 @@ run_step "01a_build_case_index" \
     python -m dataset.data_parser.build_case_index \
         --data_dir "$SSL_DIR"
 
-# 2) sample disjoint cohorts (CVP-stratified)
+# 2) sample disjoint cohorts (CVP-stratified, downstream-eligible).
+#    --downstream_dir restricts the pool to ABP-bearing cases so that every
+#    holdout id is reachable by the IOH/Hypoxemia/AKI evaluators (which
+#    require ABP). Without it, ~half of SSL cases lack ABP and fall out of
+#    the downstream test set, breaking verify_split_disjoint I2.
 #    --force lets us re-cut the same cohort layout under a fresh seed.
 run_step "01b_sample_holdout" \
     python -m dataset.data_parser.sample_holdout \
         --data_dir "$SSL_DIR" \
+        --downstream_dir "$DS_DIR" \
         --n "$HOLDOUT_N" --n_dev "$DEV_N" --seed "$COHORT_SEED" \
         --stratify_by_cvp --force
 

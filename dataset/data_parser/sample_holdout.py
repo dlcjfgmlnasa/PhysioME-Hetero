@@ -27,7 +27,7 @@ import argparse
 import json
 import os
 from collections import Counter, defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -51,6 +51,14 @@ def get_args():
     parser.add_argument('--stratify_by_cvp', action='store_true',
                         help='ensure holdout/dev have roughly the same CVP '
                              'coverage as the full dataset')
+    parser.add_argument('--downstream_dir', type=str, default=None,
+                        help='If given, restrict the sampling pool to '
+                             'case_ids that exist as <case_id>.npz inside '
+                             'this directory (= downstream-eligible cases). '
+                             'Required for I2/I2b in verify_split_disjoint.py '
+                             'to PASS, because vital_db_downstream.py with '
+                             '--require_abp drops the ~half of SSL cases '
+                             'that lack ABP.')
     parser.add_argument('--force', action='store_true')
     return parser.parse_args()
 
@@ -85,11 +93,24 @@ def _stratified_choice(rng: np.random.Generator, pool_cvp: List[str],
     return chosen_cvp, chosen_non
 
 
+def _downstream_eligible_ids(downstream_dir: str) -> set:
+    """Return case_ids that exist as <case_id>.npz inside downstream_dir.
+
+    Used to constrain the sampling pool so that holdout/dev cohorts only
+    contain cases that downstream evaluators (which require ABP for
+    MAP-based labels) can actually evaluate.
+    """
+    import glob
+    paths = glob.glob(os.path.join(downstream_dir, '*.npz'))
+    return {os.path.splitext(os.path.basename(p))[0] for p in paths}
+
+
 def sample_holdout(data_dir: str, n: int, seed: int,
                    n_dev: int = 0,
                    out_name: str = HOLDOUT_NAME,
                    dev_out_name: str = DEV_NAME,
                    stratify_by_cvp: bool = False,
+                   downstream_dir: Optional[str] = None,
                    force: bool = False) -> Dict[str, str]:
     case_index_path = os.path.join(data_dir, CASE_INDEX_NAME)
     if not os.path.isfile(case_index_path):
@@ -106,9 +127,26 @@ def sample_holdout(data_dir: str, n: int, seed: int,
     with open(case_index_path, 'r') as f:
         case_index = json.load(f)
     all_case_ids: List[str] = case_index['all_case_ids']
+
+    # Optional pool restriction: only sample from case_ids that are also
+    # present as downstream npz. This makes verify_split_disjoint.py I2
+    # (every holdout id present downstream) and the inverse I2b (dev has
+    # downstream coverage for probing) PASS by construction.
+    if downstream_dir:
+        ds_ids = _downstream_eligible_ids(downstream_dir)
+        if not ds_ids:
+            raise FileNotFoundError(
+                f'no .npz found in downstream_dir={downstream_dir!r}'
+            )
+        before = len(all_case_ids)
+        all_case_ids = [c for c in all_case_ids if c in ds_ids]
+        print(f'[sample_holdout] candidate pool restricted to '
+              f'downstream-eligible cases: {before} -> {len(all_case_ids)} '
+              f'(downstream_dir = {downstream_dir!r})')
+
     if n + n_dev > len(all_case_ids):
         raise ValueError(
-            f'n + n_dev = {n + n_dev} > total cases {len(all_case_ids)}'
+            f'n + n_dev = {n + n_dev} > eligible cases {len(all_case_ids)}'
         )
 
     rng = np.random.default_rng(seed)
@@ -118,10 +156,16 @@ def sample_holdout(data_dir: str, n: int, seed: int,
         with open(manifest_path, 'r') as f:
             manifest = json.load(f)
         case_to_bucket = _case_to_dominant_bucket(case_index, manifest)
-        # CVP is the 4th modality (last bit of bitmap key).
-        cvp_cases = [c for c in all_case_ids if case_to_bucket.get(c, '0000')[-1] == '1']
-        non_cvp_cases = [c for c in all_case_ids if c not in set(cvp_cases)]
-        cvp_ratio = len(cvp_cases) / len(all_case_ids)
+        # CVP bit. 4-modal manifests: bit 4 (last), 6-modal: bit 4 of 6.
+        # We always look at the *4th* bit (CVP slot in MODAL_ORDER).
+        # Fall back to '0' if the case had no segments (shouldn't happen).
+        def _is_cvp(cid: str) -> bool:
+            key = case_to_bucket.get(cid, '')
+            return len(key) >= 4 and key[3] == '1'
+        eligible_set = set(all_case_ids)
+        cvp_cases = [c for c in all_case_ids if _is_cvp(c)]
+        non_cvp_cases = [c for c in all_case_ids if not _is_cvp(c)]
+        cvp_ratio = len(cvp_cases) / max(len(all_case_ids), 1)
 
         ho_cvp, ho_non = _stratified_choice(rng, cvp_cases, non_cvp_cases, n)
         chosen = sorted(ho_cvp + ho_non)
@@ -212,4 +256,5 @@ if __name__ == '__main__':
                    out_name=args.out_name,
                    dev_out_name=args.dev_out_name,
                    stratify_by_cvp=args.stratify_by_cvp,
+                   downstream_dir=args.downstream_dir,
                    force=args.force)
