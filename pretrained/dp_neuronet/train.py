@@ -111,6 +111,12 @@ def get_args():
                              'predicted waveform on a fixed val batch) every '
                              'N epochs. 0 disables. Default reads yaml '
                              '(viz_every, default 5).')
+    parser.add_argument('--viz_mask_ratio', type=float, default=None,
+                        help='Mask ratio used ONLY for the viz forward (does '
+                             'not affect training). Lower than the training '
+                             'mask_ratio so the figure has enough visible '
+                             'context to be readable. Default yaml '
+                             '(viz_mask_ratio, default 0.5).')
     return parser.parse_args()
 
 
@@ -481,8 +487,9 @@ class Trainer(object):
             return
 
         x = self._viz_batch.to(device).float()
+        viz_mr = float(getattr(self.args, 'viz_mask_ratio', 0.5) or 0.5)
         real, pred, mask = self.model.forward_recon_time(
-            x, mask_ratio=self.args.mask_ratio,
+            x, mask_ratio=viz_mr,
         )
         real = real.float().cpu().numpy()         # (B, F, W)
         pred = pred.float().cpu().numpy()
@@ -514,7 +521,8 @@ class Trainer(object):
         axes[0].legend(loc='upper right', fontsize=8)
         axes[0].set_title(
             f'{self.modal_name}  recon @ epoch {epoch:03d}  '
-            f'(mask_ratio={self.args.mask_ratio}, gold = masked patches)'
+            f'(viz_mask_ratio={viz_mr}, train_mask_ratio='
+            f'{self.args.mask_ratio}, gold = masked patches)'
         )
         axes[-1].set_xlabel('time (s)')
 
@@ -589,6 +597,7 @@ if __name__ == '__main__':
                                       'probe_downstream_dir': cli.probe_downstream_dir,
                                       'probe_subjects_file': cli.probe_subjects_file,
                                       'probe_every': cli.probe_every,
-                                      'viz_every': cli.viz_every})
+                                      'viz_every': cli.viz_every,
+                                      'viz_mask_ratio': cli.viz_mask_ratio})
     trainer = Trainer(augments)
     trainer.train()

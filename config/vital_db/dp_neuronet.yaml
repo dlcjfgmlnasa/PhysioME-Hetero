@@ -21,8 +21,15 @@ probe_every: 1                           # 1 = every epoch
 # Reconstruction-quality visualization. Saves a real-vs-recon waveform PNG
 # every N epochs on a fixed 4-sample slice of the val loader. Output path:
 #   <ckpt_path>/<model_name>/<modal>/logs/recon/epoch_NNN.png
-# Set to 0 to disable.
+# Set viz_every=0 to disable.
+#
+# viz_mask_ratio decouples the visualization from the training mask_ratio
+# (which is intentionally aggressive at 0.8 for MAE supervision). 0.5 leaves
+# half the patches visible so the eye can compare unmasked context vs the
+# decoder's prediction on masked patches without the figure being dominated
+# by gold blocks.
 viz_every: 5
+viz_mask_ratio: 0.5
 
 ch_names:
   - 'ABP'
