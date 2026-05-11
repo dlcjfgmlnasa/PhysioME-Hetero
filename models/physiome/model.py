@@ -616,8 +616,31 @@ class PhysioME(nn.Module):
 
     def inference(self, data: Dict[str, torch.Tensor],
                   presence_state: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Run the multimodal encoder over only the modalities present in ``data``
-        (no restoration). Returns the fusion-token vector."""
+        """NON-CANONICAL fallback inference path. Do NOT use for downstream
+        evaluation or reported results.
+
+        Runs the multimodal encoder over only the modalities present in
+        ``data`` -- no restoration, no missing-modality token, no second
+        encoder pass. Returns ``[B, encoder_embed_dim]``.
+
+        The canonical inference path is :meth:`inference_missing_modality`,
+        which is the entire reason PhysioME-style models exist: a single
+        fusion vector that lives in a consistent latent space regardless
+        of which modal subset the input contains. This direct-encoder
+        shortcut yields fusion vectors whose effective shape changes with
+        the input subset and therefore cannot be compared across subsets,
+        defeating the model's core selling point.
+
+        Kept for:
+          * legacy compatibility with code that pre-dates restoration;
+          * profiling restoration cost vs the bare encoder (engineering,
+            not science);
+          * emergency debugging when the restoration decoder is
+            suspected of misbehaving.
+
+        Every downstream / probe call site uses
+        :meth:`inference_missing_modality`; new call sites should too.
+        """
         valid_data = {m: v for m, v in data.items()
                       if m in self.modal_names and v is not None}
         if not valid_data:
