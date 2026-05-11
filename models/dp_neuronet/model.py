@@ -186,6 +186,34 @@ class NeuroNet(nn.Module):
             return latent
         return latent[:, :1, :].squeeze()
 
+    @torch.no_grad()
+    def forward_recon_time(self, x: torch.Tensor, mask_ratio: float = 0.5):
+        """Visualization helper. Mirrors the time-view path of ``forward()`` but
+        returns frame-level tensors instead of scalar losses, so a training
+        loop can plot real-vs-predicted waveforms periodically.
+
+        Returns:
+            real_frames : ``[B, F, W]`` raw time-domain frames.
+            pred_frames : ``[B, F, W]`` decoder output, **de-normalised** back
+                          to raw-signal scale using each patch's (mean, var)
+                          when ``norm_pix_loss`` is on. This matches what the
+                          model is implicitly predicting at loss time and makes
+                          the plot directly comparable to ``real_frames``.
+            mask        : ``[B, F]`` 1 where the patch was masked.
+        """
+        was_training = self.training
+        self.eval()
+        frames_t = self._frames_time(x)                     # (B, F, W)
+        feat_t = self.frame_backbone(frames_t)              # (B, F, D)
+        _, pred_t, mask_t = self.autoencoder(feat_t, mask_ratio)
+        if self.norm_pix_loss:
+            mean = frames_t.mean(dim=-1, keepdim=True)
+            var = frames_t.var(dim=-1, keepdim=True)
+            pred_t = pred_t * (var + 1.e-6).sqrt() + mean
+        if was_training:
+            self.train()
+        return frames_t, pred_t, mask_t
+
     def forward_mae_loss(self,
                          real: torch.Tensor,
                          pred: torch.Tensor,

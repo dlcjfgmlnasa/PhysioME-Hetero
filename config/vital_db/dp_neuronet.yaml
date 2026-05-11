@@ -18,6 +18,12 @@ probe_downstream_dir: null               # vitaldb_downstream npz dir
 probe_subjects_file: null                # e.g. <ssl_data_dir>/dev_case_ids.json
 probe_every: 1                           # 1 = every epoch
 
+# Reconstruction-quality visualization. Saves a real-vs-recon waveform PNG
+# every N epochs on a fixed 4-sample slice of the val loader. Output path:
+#   <ckpt_path>/<model_name>/<modal>/logs/recon/epoch_NNN.png
+# Set to 0 to disable.
+viz_every: 5
+
 ch_names:
   - 'ABP'
   - 'ECG'

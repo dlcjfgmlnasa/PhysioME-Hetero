@@ -106,6 +106,11 @@ def get_args():
                              '(verify_split_disjoint.py I1).')
     parser.add_argument('--probe_every', type=int, default=1,
                         help='Run dev probing every N epochs (default 1).')
+    parser.add_argument('--viz_every', type=int, default=None,
+                        help='Save a reconstruction-quality figure (real vs '
+                             'predicted waveform on a fixed val batch) every '
+                             'N epochs. 0 disables. Default reads yaml '
+                             '(viz_every, default 5).')
     return parser.parse_args()
 
 
@@ -315,6 +320,23 @@ class Trainer(object):
         print('   >> Train segments : {0}'.format(len(train_dataloader.dataset)))
         print('   >> Val   segments : {0}\n'.format(len(val_dataloader.dataset)))
 
+        # Capture a fixed visualization batch (first 4 val segments) so that
+        # epoch-over-epoch reconstruction plots compare the same waveforms.
+        # Cached on CPU to keep GPU memory free during training.
+        self._viz_batch = None
+        viz_every = int(getattr(self.args, 'viz_every', 5) or 0)
+        if viz_every > 0:
+            for vx, _ in val_dataloader:
+                self._viz_batch = vx[:4].detach().clone()
+                break
+            if self._viz_batch is not None:
+                print('   >> Viz     : every {0} epoch(s), {1} sample(s) -> '
+                      '<ckpt>/logs/recon/'.format(
+                          viz_every, self._viz_batch.shape[0]))
+            else:
+                print('   >> Viz     : disabled (val loader produced no batch)')
+        self._viz_every = viz_every
+
         # bf16 autocast on CUDA (no GradScaler needed: bf16 has FP32 dynamic
         # range). Cuts step time ~1.5-2x on L40S/Ampere+ vs FP32. Set --no_amp
         # to fall back to FP32 (e.g. for debugging numerical issues).
@@ -394,6 +416,10 @@ class Trainer(object):
                     total_step, epoch, self.probe_task_key, auroc, mf1,
                 )
 
+            if self._viz_batch is not None and self._viz_every > 0 \
+                    and (epoch + 1) % self._viz_every == 0:
+                self._save_recon_viz(epoch, total_step)
+
             self.scheduler.step()
 
         self.save_ckpt(model_state=best_model_state)
@@ -434,6 +460,73 @@ class Trainer(object):
         auroc = float(roc_auc_score(ev_y, prob))
         mf1 = float(f1_score(ev_y, pred, average='macro'))
         return auroc, mf1
+
+    def _save_recon_viz(self, epoch: int, total_step: int) -> None:
+        """Save a real-vs-reconstructed waveform plot for the fixed viz batch.
+
+        Output path:
+            <ckpt>/<model_name>/<modal>/logs/recon/epoch_NNN.png
+
+        Masked patches are shaded so the reader can tell which segments the
+        decoder had to *reconstruct* vs which it just passed through. Plot
+        uses Agg backend so it works headless on KHDP / over SSH.
+        """
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            self.logger.info('viz step=%08d epoch=%03d skipped reason=%s',
+                             total_step, epoch, repr(e))
+            return
+
+        x = self._viz_batch.to(device).float()
+        real, pred, mask = self.model.forward_recon_time(
+            x, mask_ratio=self.args.mask_ratio,
+        )
+        real = real.float().cpu().numpy()         # (B, F, W)
+        pred = pred.float().cpu().numpy()
+        mask = mask.float().cpu().numpy()         # (B, F)
+
+        b, f, w = real.shape
+        fs = float(self.args.rfreq)
+        # Stitch frames -> full window. Assumes time_step == time_window
+        # (non-overlap). For overlap configs the plot still shows correct
+        # per-frame reconstruction but the stitched signal would duplicate
+        # overlapped samples; non-overlap is the v2 default.
+        t_axis = np.arange(f * w) / fs
+
+        fig, axes = plt.subplots(b, 1, figsize=(12, 2.2 * b), sharex=True)
+        if b == 1:
+            axes = [axes]
+        for i in range(b):
+            ax = axes[i]
+            ax.plot(t_axis, real[i].reshape(-1), color='steelblue',
+                    linewidth=0.9, label='real')
+            ax.plot(t_axis, pred[i].reshape(-1), color='crimson',
+                    linewidth=0.7, linestyle='--', label='recon')
+            for fi in range(f):
+                if mask[i, fi] > 0.5:
+                    ax.axvspan(fi * w / fs, (fi + 1) * w / fs,
+                               color='gold', alpha=0.15, linewidth=0)
+            ax.grid(alpha=0.3)
+            ax.set_ylabel(f'sample {i}')
+        axes[0].legend(loc='upper right', fontsize=8)
+        axes[0].set_title(
+            f'{self.modal_name}  recon @ epoch {epoch:03d}  '
+            f'(mask_ratio={self.args.mask_ratio}, gold = masked patches)'
+        )
+        axes[-1].set_xlabel('time (s)')
+
+        viz_dir = os.path.join(self.args.ckpt_path, self.args.model_name,
+                               self.modal_name, 'logs', 'recon')
+        os.makedirs(viz_dir, exist_ok=True)
+        out = os.path.join(viz_dir, f'epoch_{epoch:03d}.png')
+        fig.tight_layout()
+        fig.savefig(out, dpi=110)
+        plt.close(fig)
+        self.logger.info('viz step=%08d epoch=%03d saved=%s',
+                         total_step, epoch, out)
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader):
@@ -495,6 +588,7 @@ if __name__ == '__main__':
                                       'holdout_subjects_file': cli.holdout_subjects_file,
                                       'probe_downstream_dir': cli.probe_downstream_dir,
                                       'probe_subjects_file': cli.probe_subjects_file,
-                                      'probe_every': cli.probe_every})
+                                      'probe_every': cli.probe_every,
+                                      'viz_every': cli.viz_every})
     trainer = Trainer(augments)
     trainer.train()

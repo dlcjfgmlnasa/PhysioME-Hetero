@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
-# 02_phase1.sh — Phase-1 unimodal SSL for all 6 modalities.
-# Honors $PHASE1_PARALLEL: 1 = sequential, 2 = pair on (cuda:0, cuda:1) per round.
+# 02_phase1.sh — Phase-1 unimodal SSL for all 6 modalities, in order.
+#
+# Sequential by default (PHASE1_PARALLEL=1). Honors $PHASE1_PARALLEL:
+#   1 = run modalities one at a time on cuda:0
+#   2 = pair on (cuda:0, cuda:1) per round  (needs ~24 GB free/GPU + 60 GB RAM)
+#
+# Auto-resume:
+#   A modality whose best_model.pth already exists is skipped, so re-running
+#   after a partial run (e.g. ABP done, ECG killed) picks up at ECG without
+#   re-training what's already finished. Set FORCE=1 to retrain everything.
 source "$(dirname "$0")/_env.sh"
 print_env
 
 CH_NAMES=(ABP ECG PPG CVP CO2 AWP)
+CH_IDXS=(0 1 2 3 4 5)
+FORCE="${FORCE:-0}"
+
+ckpt_done() {
+    local name="$1"
+    local p="$CKPT_ROOT/neuronet/${name}/model/best_model.pth"
+    [[ -f "$p" ]]
+}
 
 train_one() {
     # NOTE: split across lines because `set -u` evaluates ${CH_NAMES[$idx]}
@@ -14,6 +30,11 @@ train_one() {
     local gpu="$2"
     local name="${CH_NAMES[$idx]}"
     local out="$LOG_DIR/02_phase1_${name}.log"
+    if [[ "$FORCE" != "1" ]] && ckpt_done "$name"; then
+        log "↷ SKIP  phase1[$name] — best_model.pth already exists "
+            "(set FORCE=1 to retrain)"
+        return 0
+    fi
     log "▶ START phase1[$name] (idx=$idx gpu=$gpu eager=$EAGER) → $out"
     local eager_args=()
     if [[ "$EAGER" == "1" ]]; then
@@ -43,7 +64,7 @@ train_one() {
 }
 
 if [[ "$PHASE1_PARALLEL" == "2" ]]; then
-    log "Phase-1: 2-GPU parallel (3 rounds × 2 modals)"
+    log "Phase-1: 2-GPU parallel (3 rounds × 2 modals, skipping done)"
     for round in 0 1 2; do
         a=$((round * 2)); b=$((round * 2 + 1))
         train_one "$a" 0 &
@@ -53,8 +74,8 @@ if [[ "$PHASE1_PARALLEL" == "2" ]]; then
         wait "$pid_a" "$pid_b"
     done
 else
-    log "Phase-1: sequential on cuda:0"
-    for idx in 0 1 2 3 4 5; do
+    log "Phase-1: sequential on cuda:0 (skipping done)"
+    for idx in "${CH_IDXS[@]}"; do
         train_one "$idx" 0
     done
 fi
