@@ -55,6 +55,29 @@ PRESENCE_NATURALLY_ABSENT: int = 2
 NUM_PRESENCE_STATES: int = 3
 
 
+# Physiology-grouped decoder mapping.
+#   cardiovascular : cardiac-driven pulsatile signals (~1 Hz cardiac cycle)
+#   respiratory    : respiration-driven signals       (~0.2 Hz breath cycle)
+# Within each group, the decoder *body* (transformer stack) is shared across
+# modalities; only the small per-modal prediction head (Linear -> backbone_dim)
+# remains modality-specific. Rationale:
+#   * Param efficiency: 6 decoders -> 2 bodies + 6 heads (~3-4x param cut).
+#   * Gradient sharing: rare modalities (CVP / CO2 / AWP) piggyback on
+#     same-group abundant modalities' gradients instead of starving on their
+#     own small share of the batch.
+#   * Inductive bias: signals within a group share temporal scale and
+#     morphology family, so a shared body learns reusable features.
+# Override via PhysioME(..., modal_to_group=<dict>) for ablations.
+DEFAULT_MODAL_TO_GROUP: Dict[str, str] = {
+    'ABP': 'cardiovascular',
+    'ECG': 'cardiovascular',
+    'PPG': 'cardiovascular',
+    'CVP': 'cardiovascular',
+    'CO2': 'respiratory',
+    'AWP': 'respiratory',
+}
+
+
 def _build_xfmr(d_model: int, num_heads: int, num_layers: int) -> TransformerEncoder:
     """uni2ts-derived TransformerEncoder used by every PhysioME stack
     (multimodal encoder, MAE decoder, restoration decoder).
@@ -88,13 +111,26 @@ class PhysioME(nn.Module):
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
                  decoder_embed_dim: int, decoder_heads: int, decoder_depths: int,
                  decoder_recon_depths: int,
-                 projection_hidden: List[int], temperature: float):
+                 projection_hidden: List[int], temperature: float,
+                 modal_to_group: Optional[Dict[str, str]] = None):
         super().__init__()
         self.modal_names = list(backbone_networks.keys())
         self.backbone_networks = nn.ModuleDict(backbone_networks)
         self.num_backbone_frames = num_backbone_frames
         self.backbone_embed_dim = backbone_embed_dim
         self.encoder_embed_dim, self.decoder_embed_dim = encoder_embed_dim, decoder_embed_dim
+
+        # Resolve modal -> group mapping. Defaults to physiology grouping
+        # (cardiovascular / respiratory). Every modal in ``backbone_networks``
+        # must have a group; unknown modals fall back to a per-modal group
+        # (no sharing) so custom modalities never silently collide.
+        mapping = dict(modal_to_group) if modal_to_group is not None \
+            else dict(DEFAULT_MODAL_TO_GROUP)
+        self.modal_to_group: Dict[str, str] = {
+            m: mapping.get(m, m) for m in self.modal_names
+        }
+        # Stable, sorted group list — order matters for ModuleDict iteration.
+        self.groups: List[str] = sorted(set(self.modal_to_group.values()))
 
         self.input_size = (self.num_backbone_frames, self.encoder_embed_dim)
         self.patch_size = (1, self.encoder_embed_dim)
@@ -131,14 +167,18 @@ class PhysioME(nn.Module):
             d_model=encoder_embed_dim, num_heads=encoder_heads, num_layers=encoder_depths,
         )
 
-        # [MultiModal Decoder] -- per-modal RoPE encoder stack, shared decoder_embed.
+        # [MultiModal Decoder] -- per-group RoPE encoder stack (body) shared
+        # across modalities within the same physiology group, plus a per-modal
+        # linear prediction head. The body learns the temporal/morphological
+        # structure of the group; the head re-maps to each modal's specific
+        # output distribution.
         self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.multimodal_decoder_dict = nn.ModuleDict({
-            modal_name: _build_xfmr(
+        self.multimodal_decoder_body_dict = nn.ModuleDict({
+            group: _build_xfmr(
                 d_model=decoder_embed_dim, num_heads=decoder_heads, num_layers=decoder_depths,
             )
-            for modal_name in self.modal_names
+            for group in self.groups
         })
         self.multimodal_decoder_pred_dict = nn.ModuleDict({
             modal_name: nn.Linear(decoder_embed_dim, backbone_embed_dim, bias=True)
@@ -146,12 +186,13 @@ class PhysioME(nn.Module):
         })
 
         # [MultiModal Decoder - Restoration (for missing modality)]
+        # Same grouping as the MAE decoder above.
         self.recon_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
-        self.multimodal_recon_dict = nn.ModuleDict({
-            modal_name: _build_xfmr(
+        self.multimodal_recon_body_dict = nn.ModuleDict({
+            group: _build_xfmr(
                 d_model=decoder_embed_dim, num_heads=decoder_heads, num_layers=decoder_recon_depths,
             )
-            for modal_name in self.modal_names
+            for group in self.groups
         })
         self.multimodal_recon_pred_dict = nn.ModuleDict({
             modal_name: nn.Linear(decoder_embed_dim, backbone_embed_dim, bias=True)
@@ -274,7 +315,8 @@ class PhysioME(nn.Module):
 
             x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
-            x = self.multimodal_decoder_dict[modal_name](x)  # final RMSNorm inside
+            group = self.modal_to_group[modal_name]
+            x = self.multimodal_decoder_body_dict[group](x)  # final RMSNorm inside
             x = self.multimodal_decoder_pred_dict[modal_name](x)
             reconstructed_patches.append(x.contiguous())
 
@@ -300,7 +342,8 @@ class PhysioME(nn.Module):
 
             x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
 
-            x = self.multimodal_recon_dict[modal_name](x)  # final RMSNorm inside
+            group = self.modal_to_group[modal_name]
+            x = self.multimodal_recon_body_dict[group](x)  # final RMSNorm inside
             x = self.multimodal_recon_pred_dict[modal_name](x)
             reconstructed_patches.append(x.contiguous())
 
@@ -636,11 +679,16 @@ if __name__ == '__main__':
 
     embed_dim = 64
     num_frames = 5
+    # Exercise the 2-group decoder: ABP/ECG/PPG/CVP → cardiovascular,
+    # CO2/AWP → respiratory. Two distinct decoder bodies must be built.
     net = PhysioME(
         backbone_networks={
             'ABP': TinyBackbone(num_frames, embed_dim),
             'ECG': TinyBackbone(num_frames, embed_dim),
             'PPG': TinyBackbone(num_frames, embed_dim),
+            'CVP': TinyBackbone(num_frames, embed_dim),
+            'CO2': TinyBackbone(num_frames, embed_dim),
+            'AWP': TinyBackbone(num_frames, embed_dim),
         },
         backbone_embed_dim=embed_dim, num_backbone_frames=num_frames,
         encoder_embed_dim=128, encoder_heads=4, encoder_depths=2,
@@ -648,13 +696,13 @@ if __name__ == '__main__':
         decoder_recon_depths=2,
         projection_hidden=[256, 128], temperature=0.1,
     )
+    print(f'[groups] {net.groups}')
+    print(f'[decoder body keys] {list(net.multimodal_decoder_body_dict.keys())}')
+    assert list(net.multimodal_decoder_body_dict.keys()) == ['cardiovascular',
+                                                              'respiratory']
 
     B = 4
-    complete = {
-        'ABP': torch.randn(B, 3000),
-        'ECG': torch.randn(B, 3000),
-        'PPG': torch.randn(B, 3000),
-    }
+    complete = {m: torch.randn(B, 3000) for m in net.modal_names}
     inter, miss, contra, acc = net(complete, mask_ratio=0.5)
     print(f'[complete] inter={inter.item():.3f}  miss={miss.item():.3f}  '
           f'contra={contra.item():.3f}  acc={acc.item():.3f}')

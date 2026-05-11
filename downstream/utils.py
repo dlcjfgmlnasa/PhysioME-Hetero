@@ -50,6 +50,11 @@ def load_pretrained_to_classifier(ckpt_path: str, n_classes: int):
         decoder_recon_depths=multimodal_param['decoder_recon_depths'],
         projection_hidden=multimodal_param['projection_hidden'],
         temperature=multimodal_param['temperature'],
+        # Pre-grouping checkpoints (per-modal decoders) won't carry this key;
+        # PhysioME then falls back to DEFAULT_MODAL_TO_GROUP. Old ckpts must
+        # be re-trained — their state_dict keys (multimodal_decoder_dict.*)
+        # are incompatible with the new (multimodal_decoder_body_dict.*) layout.
+        modal_to_group=multimodal_param.get('modal_to_group'),
     )
     physio_me.load_state_dict(model_state)
 

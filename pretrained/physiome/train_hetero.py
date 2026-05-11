@@ -121,6 +121,7 @@ class HeteroTrainer:
             decoder_recon_depths=args.decoder_recon_depths,
             projection_hidden=args.projection_hidden,
             temperature=args.temperature,
+            modal_to_group=getattr(args, 'modal_to_group', None),
         ).to(device)
 
         self.eff_batch_size = self.args.train_batch_size * self.args.train_batch_accumulation
@@ -142,6 +143,8 @@ class HeteroTrainer:
               f'{getattr(self.args, "probe_subjects_file", None) or "<none>"}')
         print(f'   >> Probe modalities : {", ".join(self.probe_ch_names)}')
         print(f'   >> restoration_only_on_complete = {self.args.restoration_only_on_complete}')
+        print(f'   >> Decoder groups   : {self.model.groups}')
+        print(f'   >> Modal -> group   : {self.model.modal_to_group}')
 
     # ------------------------------------------------------------------
     # Logger
@@ -423,6 +426,7 @@ class HeteroTrainer:
                 'decoder_recon_depths': self.args.decoder_recon_depths,
                 'projection_hidden': self.args.projection_hidden,
                 'temperature': self.args.temperature,
+                'modal_to_group': dict(self.model.modal_to_group),
             },
             'model_state': model_state,
             'hyperparameter': self.args.__dict__,

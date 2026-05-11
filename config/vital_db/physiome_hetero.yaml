@@ -69,6 +69,19 @@ decoder_embed_dim: 256
 decoder_heads: 8
 decoder_depths: 3
 decoder_recon_depths: 8
+
+# Decoder grouping. Bodies are shared within a group; per-modal heads stay
+# distinct. Set to null to fall back to PhysioME default (cardiovascular =
+# ABP/ECG/PPG/CVP, respiratory = CO2/AWP). For an ablation that disables
+# grouping (per-modal decoders), set every modal to its own group, e.g.:
+#   modal_to_group: {ABP: ABP, ECG: ECG, PPG: PPG, CVP: CVP, CO2: CO2, AWP: AWP}
+modal_to_group:
+  ABP: cardiovascular
+  ECG: cardiovascular
+  PPG: cardiovascular
+  CVP: cardiovascular
+  CO2: respiratory
+  AWP: respiratory
 projection_hidden:
   - 1024
   - 512

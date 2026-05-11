@@ -284,7 +284,8 @@ class Trainer(object):
                 'decoder_depths': self.args.decoder_depths,
                 'decoder_recon_depths': self.args.decoder_recon_depths,
                 'projection_hidden': self.args.projection_hidden,
-                'temperature': self.args.temperature
+                'temperature': self.args.temperature,
+                'modal_to_group': dict(self.model.modal_to_group),
             },
             'model_state': multimodal_model_state,
             'hyperparameter': self.args.__dict__,
