@@ -50,8 +50,17 @@ def main(args: argparse.Namespace) -> None:
 
     excluded = _load_case_ids(args.holdout) | _load_case_ids(args.dev)
 
+    # case_index.json schema (CSR-style, one entry per SHARD):
+    #   shards[si] = {
+    #       'path': ...,
+    #       'n_segments': N_si,
+    #       'case_ids_unique': [c0, c1, ..., c_{K-1}],
+    #       'case_offsets':    [0, off1, off2, ..., N_si],
+    #   }
+    # segment local-index ``li`` belongs to case_ids_unique[k] where
+    # case_offsets[k] <= li < case_offsets[k+1].
     case_index_path = os.path.join(args.data_dir, 'case_index.json')
-    seg_case_ids = None
+    case_index_shards = None
     if excluded:
         if not os.path.isfile(case_index_path):
             raise FileNotFoundError(
@@ -60,17 +69,33 @@ def main(args: argparse.Namespace) -> None:
                 f'--data_dir {args.data_dir!r}'
             )
         with open(case_index_path, 'r', encoding='utf-8') as f:
-            seg_case_ids = json.load(f)['shards']
+            case_index_shards = json.load(f)['shards']
+
+    def _build_segment_case_lookup(idx_shard: dict, n_segs: int):
+        """Return a list ``cids`` of length ``n_segs`` where ``cids[li]`` is
+        the case_id of the li-th segment in the shard."""
+        uniques = idx_shard['case_ids_unique']
+        offsets = idx_shard['case_offsets']
+        out = [''] * n_segs
+        for k, cid in enumerate(uniques):
+            lo, hi = offsets[k], offsets[k + 1]
+            for li in range(lo, hi):
+                out[li] = str(cid)
+        return out
 
     bucket_counter: Counter = Counter()
     n_total = 0
     n_excluded = 0
     for si, shard in enumerate(shards):
         keys = shard['bitmap_keys']
+        seg_cids = None
+        if case_index_shards is not None:
+            seg_cids = _build_segment_case_lookup(
+                case_index_shards[si], len(keys),
+            )
         for li, key in enumerate(keys):
-            if seg_case_ids is not None:
-                cid = str(seg_case_ids[si][li])
-                if cid in excluded:
+            if seg_cids is not None:
+                if seg_cids[li] in excluded:
                     n_excluded += 1
                     continue
             bucket_counter[key] += 1
