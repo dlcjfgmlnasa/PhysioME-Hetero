@@ -459,12 +459,35 @@ class Trainer(object):
         return np.concatenate(feats, 0), np.concatenate(labels, 0)
 
     def _run_probe(self) -> Tuple[float, float]:
-        """One LR-probe pass on the dev cohort. Returns (auroc, macro_f1)."""
+        """One LR-probe pass on the dev cohort. Returns (auroc, macro_f1).
+
+        Latents can contain NaN when the dev npz has NaN-padded segments
+        (artifact-rejected regions) or when the still-warming encoder
+        underflows on a degenerate input. We drop those rows rather than
+        crashing the whole epoch — the probe is a monitoring tool, not a
+        training signal, so partial coverage with a warning is the right
+        trade-off. If too many rows drop we return NaN metrics.
+        """
         tr_x, tr_y = self._extract_probe_latents(self.probe_train_loader)
         ev_x, ev_y = self._extract_probe_latents(self.probe_eval_loader)
+
+        def _drop_nan_rows(x, y, split: str):
+            keep = np.isfinite(x).all(axis=1)
+            n_drop = int((~keep).sum())
+            if n_drop:
+                self.logger.info(
+                    'probe_nan split=%s dropped=%d of=%d',
+                    split, n_drop, x.shape[0],
+                )
+            return x[keep], y[keep]
+
+        tr_x, tr_y = _drop_nan_rows(tr_x, tr_y, 'train')
+        ev_x, ev_y = _drop_nan_rows(ev_x, ev_y, 'eval')
+
         if len(tr_y) == 0 or len(ev_y) == 0 or len(set(tr_y)) < 2 \
                 or len(set(ev_y)) < 2:
-            # Degenerate probe (single class on either side) — skip metric.
+            # Degenerate probe (empty after NaN drop, or single class on
+            # either side) — skip metric but keep training.
             return float('nan'), float('nan')
         scaler = StandardScaler()
         tr_x = scaler.fit_transform(tr_x)
