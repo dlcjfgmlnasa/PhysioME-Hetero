@@ -40,6 +40,10 @@ train_one() {
     if [[ "$EAGER" == "1" ]]; then
         eager_args+=(--eager --eager_workers "$EAGER_WORKERS")
     fi
+    local smoke_args=()
+    if [[ -n "${SMOKE_TEST_SHARDS:-}" && "$SMOKE_TEST_SHARDS" != "0" ]]; then
+        smoke_args+=(--smoke_test_shards "$SMOKE_TEST_SHARDS")
+    fi
     CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dp_neuronet.train \
         --config_yaml config/vital_db/dp_neuronet.yaml \
         --ch_idx "$idx" \
@@ -53,6 +57,7 @@ train_one() {
         --probe_subjects_file   "$DEV_JSON" \
         --probe_every 1 \
         "${eager_args[@]}" \
+        "${smoke_args[@]}" \
         > "$out" 2>&1
     local rc=$?
     if [[ $rc -eq 0 ]]; then

@@ -117,6 +117,12 @@ def get_args():
                              'mask_ratio so the figure has enough visible '
                              'context to be readable. Default yaml '
                              '(viz_mask_ratio, default 0.5).')
+    parser.add_argument('--smoke_test_shards', type=int, default=None,
+                        help='Smoke-test mode: cap to the first N shards from '
+                             'manifest (train/val/eval split then applies on '
+                             'top). 0 / unset = use all shards. Recommended '
+                             'N>=3 (one per split). Use to verify the loop '
+                             'runs end-to-end without a multi-hour wait.')
     return parser.parse_args()
 
 
@@ -154,6 +160,11 @@ class Trainer(object):
         from pretrained.dp_neuronet.hetero_data_loader import _read_manifest
         manifest = _read_manifest(self.args.ssl_data_dir)
         self.num_shards = len(manifest['shards'])
+        smoke_n = int(getattr(self.args, 'smoke_test_shards', 0) or 0)
+        if smoke_n > 0 and smoke_n < self.num_shards:
+            print(f'[smoke_test] capping to first {smoke_n}/{self.num_shards} '
+                  f'shards (split_shards applies on top)')
+            self.num_shards = smoke_n
         self.train_shards, self.val_shards, self.eval_shards = split_shards(
             num_shards=self.num_shards,
             val_ratio=getattr(self.args, 'val_shard_ratio', 0.1),
@@ -598,6 +609,7 @@ if __name__ == '__main__':
                                       'probe_subjects_file': cli.probe_subjects_file,
                                       'probe_every': cli.probe_every,
                                       'viz_every': cli.viz_every,
-                                      'viz_mask_ratio': cli.viz_mask_ratio})
+                                      'viz_mask_ratio': cli.viz_mask_ratio,
+                                      'smoke_test_shards': cli.smoke_test_shards})
     trainer = Trainer(augments)
     trainer.train()
