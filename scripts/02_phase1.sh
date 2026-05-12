@@ -75,7 +75,18 @@ if [[ "$PHASE1_PARALLEL" == "2" ]]; then
     done
 else
     log "Phase-1: sequential on cuda:0 (skipping done)"
+    START_FROM="${START_FROM:-}"
+    started=0
     for idx in "${CH_IDXS[@]}"; do
+        name="${CH_NAMES[$idx]}"
+        if [[ -n "$START_FROM" && "$started" != "1" ]]; then
+            if [[ "$name" == "$START_FROM" ]]; then
+                started=1
+            else
+                log "↷ SKIP  phase1[$name] — before START_FROM=$START_FROM"
+                continue
+            fi
+        fi
         train_one "$idx" 0
     done
 fi

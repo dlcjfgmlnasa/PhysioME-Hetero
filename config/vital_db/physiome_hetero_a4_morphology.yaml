@@ -1,13 +1,19 @@
-# Ablation A3: restoration_only_on_complete = false
+# Ablation A4 (variant: morphology). modal_to_group based on waveform
+# morphology rather than physiology:
+#   pulsatile   : ABP / PPG / CVP  (mechanical pressure/volume waves)
+#   electrical  : ECG               (depolarisation waveforms)
+#   respiratory : CO2 / AWP         (gas concentration + airway pressure)
+# Tests whether morphology-based grouping (waveform-feature affinity) is a
+# stronger inductive bias than cardiac/respiratory physiology grouping.
+# Note: 'electrical' is a single-modal group, so ECG effectively gets its
+# own decoder body — that is the intended ablation behaviour.
 # All other settings identical to physiome_hetero.yaml.
-# Train with: python pretrained/physiome/train_hetero.py --config_yaml config/vital_db/physiome_hetero_a3.yaml
+# Train with: python -m pretrained.physiome.train_hetero --config_yaml config/vital_db/physiome_hetero_a4_morphology.yaml
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero_v2/train'
 
-# See physiome_hetero.yaml. Same values here.
 holdout_subjects_file: null
 
-# Dev-cohort linear probing (disjoint from holdout/test).
 probe_subjects_file: null
 probe_downstream_dir: null
 probe_every: 1
@@ -51,6 +57,16 @@ decoder_embed_dim: 256
 decoder_heads: 8
 decoder_depths: 3
 decoder_recon_depths: 8
+
+# A4 ablation: morphology-based 3-group decoder.
+modal_to_group:
+  ABP: pulsatile
+  PPG: pulsatile
+  CVP: pulsatile
+  ECG: electrical
+  CO2: respiratory
+  AWP: respiratory
+
 projection_hidden:
   - 1024
   - 512
@@ -61,13 +77,11 @@ lora_r: 4
 lora_alpha: 16
 lora_dropout: 0.05
 
-# A3 ablation toggle: enable restoration on incomplete (partial-real) batches.
-restoration_only_on_complete: false
+restoration_only_on_complete: true
 
-# Probe efficiency knob — see physiome_hetero.yaml.
 probe_max_subsets: 15
 
 print_point: 20
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
-model_name: 'physiome_hetero_a3'
+model_name: 'physiome_hetero_a4_morphology'
 seed: 777

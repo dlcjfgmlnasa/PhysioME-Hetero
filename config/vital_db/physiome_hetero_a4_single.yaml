@@ -1,13 +1,15 @@
-# Ablation A3: restoration_only_on_complete = false
+# Ablation A4 (variant: single-group). modal_to_group = all-in-one, so a
+# single decoder body is shared across all 6 modalities; per-modal heads
+# stay distinct. Maximally aggressive sharing — opposite end of the A4
+# axis from per-modal. Tests whether the 2-group physiology split adds
+# any inductive bias beyond pure parameter sharing.
 # All other settings identical to physiome_hetero.yaml.
-# Train with: python pretrained/physiome/train_hetero.py --config_yaml config/vital_db/physiome_hetero_a3.yaml
+# Train with: python -m pretrained.physiome.train_hetero --config_yaml config/vital_db/physiome_hetero_a4_single.yaml
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero_v2/train'
 
-# See physiome_hetero.yaml. Same values here.
 holdout_subjects_file: null
 
-# Dev-cohort linear probing (disjoint from holdout/test).
 probe_subjects_file: null
 probe_downstream_dir: null
 probe_every: 1
@@ -51,6 +53,17 @@ decoder_embed_dim: 256
 decoder_heads: 8
 decoder_depths: 3
 decoder_recon_depths: 8
+
+# A4 ablation: single shared group (all 6 modalities → one decoder body).
+# Tests whether physiology-aware grouping > naive full sharing.
+modal_to_group:
+  ABP: all
+  ECG: all
+  PPG: all
+  CVP: all
+  CO2: all
+  AWP: all
+
 projection_hidden:
   - 1024
   - 512
@@ -61,13 +74,11 @@ lora_r: 4
 lora_alpha: 16
 lora_dropout: 0.05
 
-# A3 ablation toggle: enable restoration on incomplete (partial-real) batches.
-restoration_only_on_complete: false
+restoration_only_on_complete: true
 
-# Probe efficiency knob — see physiome_hetero.yaml.
 probe_max_subsets: 15
 
 print_point: 20
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
-model_name: 'physiome_hetero_a3'
+model_name: 'physiome_hetero_a4_single'
 seed: 777

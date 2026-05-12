@@ -4,7 +4,7 @@
 # on the dev cohort (case_ids in ``probe_subjects_file``) windowed via
 # ``downstream/tasks/hypotension.py`` for the IOH task.
 
-ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero/train'
+ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero_v2/train'
 
 # Subject-level holdout for downstream evaluation. Same list must be used
 # for Phase-1 (dp_neuronet.yaml) and downstream evaluators -- otherwise
@@ -26,12 +26,12 @@ probe_every: 1                           # run probe every N epochs
 # (anesthesia / mechanical-ventilation / central-line) rather than uniform
 # random.
 modality_name2path:
-  'ABP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ABP/model/best_model.pth'
-  'ECG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/ECG/model/best_model.pth'
-  'PPG': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/PPG/model/best_model.pth'
-  'CVP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CVP/model/best_model.pth'
-  'CO2': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/CO2/model/best_model.pth'
-  'AWP': '/home/coder/workspace/updown/physiome_hetero/ckpt/neuronet/AWP/model/best_model.pth'
+  'ABP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/ABP/model/best_model.pth'
+  'ECG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/ECG/model/best_model.pth'
+  'PPG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/PPG/model/best_model.pth'
+  'CVP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/CVP/model/best_model.pth'
+  'CO2': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/CO2/model/best_model.pth'
+  'AWP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/AWP/model/best_model.pth'
 
 # Signal config.
 sfreq: 100
@@ -109,7 +109,7 @@ probe_max_subsets: 15
 
 print_point: 20
 # Phase-2 ckpt root (same parent as Phase-1; model_name keeps them separate).
-# Save path: <ckpt_path>/physiome_hetero/...
-ckpt_path: '/home/coder/workspace/updown/physiome_hetero/ckpt/'
+# Save path: <ckpt_path>/physiome_hetero_v2/...
+ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
 model_name: 'physiome_hetero'
 seed: 777

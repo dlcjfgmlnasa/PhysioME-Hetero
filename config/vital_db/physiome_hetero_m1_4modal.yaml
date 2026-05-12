@@ -1,13 +1,15 @@
-# Ablation A3: restoration_only_on_complete = false
-# All other settings identical to physiome_hetero.yaml.
-# Train with: python pretrained/physiome/train_hetero.py --config_yaml config/vital_db/physiome_hetero_a3.yaml
+# Ablation M1 (variant: 4-modal). Adds CVP (~25% prevalence, sparse
+# central-line modality) to the cardiovascular trio. First scale-up step
+# where the long-tail-bucket dynamics kick in (CVP-absent buckets dominate
+# the cohort by ~3:1).
+# Compare against m1_3modal (baseline trio), m1_5modal (+CO2), and the
+# 6-modal baseline (physiome_hetero.yaml).
+# Train with: python -m pretrained.physiome.train_hetero --config_yaml config/vital_db/physiome_hetero_m1_4modal.yaml
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero_v2/train'
 
-# See physiome_hetero.yaml. Same values here.
 holdout_subjects_file: null
 
-# Dev-cohort linear probing (disjoint from holdout/test).
 probe_subjects_file: null
 probe_downstream_dir: null
 probe_every: 1
@@ -17,8 +19,6 @@ modality_name2path:
   'ECG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/ECG/model/best_model.pth'
   'PPG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/PPG/model/best_model.pth'
   'CVP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/CVP/model/best_model.pth'
-  'CO2': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/CO2/model/best_model.pth'
-  'AWP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/AWP/model/best_model.pth'
 
 sfreq: 100
 rfreq: 100
@@ -51,6 +51,16 @@ decoder_embed_dim: 256
 decoder_heads: 8
 decoder_depths: 3
 decoder_recon_depths: 8
+
+# All four modalities are cardiovascular — single decoder group will
+# materialize in practice (m1_4modal effectively tests the trio plus a
+# sparse same-group modality without yet adding a second group).
+modal_to_group:
+  ABP: cardiovascular
+  ECG: cardiovascular
+  PPG: cardiovascular
+  CVP: cardiovascular
+
 projection_hidden:
   - 1024
   - 512
@@ -61,13 +71,11 @@ lora_r: 4
 lora_alpha: 16
 lora_dropout: 0.05
 
-# A3 ablation toggle: enable restoration on incomplete (partial-real) batches.
-restoration_only_on_complete: false
+restoration_only_on_complete: true
 
-# Probe efficiency knob — see physiome_hetero.yaml.
 probe_max_subsets: 15
 
 print_point: 20
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
-model_name: 'physiome_hetero_a3'
+model_name: 'physiome_hetero_m1_4modal'
 seed: 777
