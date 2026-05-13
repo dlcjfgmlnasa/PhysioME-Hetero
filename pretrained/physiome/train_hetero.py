@@ -42,7 +42,7 @@ from models.transformer import apply_lora
 from torch.utils.data import DataLoader
 
 from downstream.tasks.hypotension import HypotensionDataset
-from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
+from models.dp_neuronet.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from models.utils import model_size
 from pretrained.physiome.hetero_data_loader import (
@@ -195,7 +195,7 @@ class HeteroTrainer:
         return train_loader, eval_loader
 
     # ------------------------------------------------------------------
-    # Encoder backbones (LoRA-wrapped NeuroNet encoders, same as train.py)
+    # Encoder backbones (LoRA-wrapped BiosignalEncoders, same as train.py)
     # ------------------------------------------------------------------
     def _encoder_backbones(self) -> Dict[str, nn.Module]:
         return {
@@ -204,29 +204,32 @@ class HeteroTrainer:
         }
 
     def _load_pretrained_unimodal(self, ckpt_path: str) -> nn.Module:
+        """Load a Phase-1 BiosignalDINO checkpoint and return a LoRA-wrapped encoder.
+
+        BiosignalDINO checkpoints (``ssl_kind=='dinov3'``) carry an
+        ``encoder_state`` field with the student-encoder state-dict prefix-
+        stripped, so the encoder loads in one ``load_state_dict`` call. The
+        head / teacher / centering buffer are discarded — Phase-2 only needs
+        the unimodal encoder.
+        """
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model_parameter = ckpt['model_parameter']
-        pretrained_model = NeuroNet(**model_parameter)
-        # strict=False: tolerates Phase-1 ckpts saved before the MAE decoder
-        # was migrated from timm.Block to BFM TransformerEncoder. The encoder
-        # / frame_backbone / cls_token weights -- the only ones Phase-2 actually
-        # transfers -- are present in both layouts; only the decoder keys
-        # differ and Phase-2 discards the decoder anyway.
-        pretrained_model.load_state_dict(ckpt['model_state'], strict=False)
-
-        backbone = NeuroNetEncoder(
+        backbone = BiosignalEncoder(
             fs=model_parameter['fs'], second=model_parameter['second'],
-            time_window=model_parameter['time_window'], time_step=model_parameter['time_step'],
+            time_window=model_parameter['time_window'],
+            time_step=model_parameter['time_step'],
             encoder_embed_dim=model_parameter['encoder_embed_dim'],
             encoder_heads=model_parameter['encoder_heads'],
             encoder_depths=model_parameter['encoder_depths'],
         )
-        # Direct submodule transfer — NeuroNet ↔ NeuroNetEncoder share the same
-        # patch_embed / encoder / cls_token shape; no name-substring matching needed.
-        backbone.frame_backbone.load_state_dict(pretrained_model.frame_backbone.state_dict())
-        backbone.patch_embed.load_state_dict(pretrained_model.autoencoder.patch_embed.state_dict())
-        backbone.encoder.load_state_dict(pretrained_model.autoencoder.encoder.state_dict())
-        backbone.cls_token = pretrained_model.autoencoder.cls_token
+        if 'encoder_state' in ckpt:
+            backbone.load_state_dict(ckpt['encoder_state'], strict=True)
+        else:
+            raise RuntimeError(
+                f'Checkpoint {ckpt_path!r} has no "encoder_state" key. '
+                'Pre-DINOv3 checkpoints (NeuroNet/TF-C) are no longer supported — '
+                'retrain Phase-1 with the BiosignalDINO trainer.'
+            )
 
         # Hand-rolled LoRA on GQA's ``out_proj`` (drops the peft dep + cleans
         # up state-dict keys). See ``models/transformer/lora.py``.

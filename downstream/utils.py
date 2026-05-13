@@ -2,7 +2,7 @@
 import torch
 
 from downstream.model import PhysioMEClassifier
-from models.dp_neuronet.model import NeuroNetEncoder
+from models.dp_neuronet.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from models.transformer import apply_lora
 
@@ -20,12 +20,12 @@ def load_pretrained_to_classifier(ckpt_path: str, n_classes: int):
     model_state = ckpt['model_state']
     hyperparameter = ckpt['hyperparameter']
 
-    # Build one LoRA-wrapped NeuroNetEncoder per modality (hand-rolled LoRA — see
+    # Build one LoRA-wrapped BiosignalEncoder per modality (hand-rolled LoRA — see
     # ``models/transformer/lora.py``). The wrap order matches the trainers'
     # ``_load_pretrained_unimodal``: build encoder, then ``apply_lora``.
     backbone_networks = {}
     for ch_name in ch_names:
-        encoder = NeuroNetEncoder(**unimodal_param)
+        encoder = BiosignalEncoder(**unimodal_param)
         encoder = apply_lora(
             encoder,
             target_attrs=('out_proj',),

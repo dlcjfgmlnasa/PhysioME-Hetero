@@ -1,37 +1,52 @@
 # -*- coding:utf-8 -*-
+"""Phase-1 unimodal SSL model: DINOv3-style self-distillation.
+
+Replaces the prior NeuroNet (TF-C: recon + time/freq/cross contrastive) and
+MaskedAutoEncoderViT classes. The encoder backbone (CNN frame backbone +
+RoPE Transformer) is unchanged so existing Phase-2 code that pulls
+``frame_backbone`` / ``patch_embed`` / ``encoder`` / ``cls_token`` continues
+to work after a ckpt-format migration.
+
+Two public classes:
+
+``BiosignalEncoder``
+    Encoder-only module reused by Phase-2 to build the per-modal frozen
+    backbone. Identical to the former ``NeuroNetEncoder``; renamed for
+    accuracy now that the Phase-1 SSL objective is DINOv3, not NeuroNet's
+    TF-C.
+
+``BiosignalDINO``
+    Phase-1 trainer-side wrapper. Student + EMA teacher copies of
+    ``BiosignalEncoder``, a shared ``DINOHead``, the centering buffer,
+    multi-crop forward, DINO + iBOT losses, and EMA update / centering
+    utilities. Phase-2 only consumes ``self.student_encoder`` (saved
+    standalone under ``encoder_state`` in the ckpt); the head / teacher /
+    center buffer are SSL-only and discarded at Phase-2 init.
+"""
+from __future__ import annotations
+
+import copy
+import math
 from functools import partial
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from models.dp_neuronet.dino_head import DINOHead
 from models.dp_neuronet.resnet1d import FrameBackBone
-from models.loss import NTXentLoss
 from models.transformer import (
-    TransformerEncoder, RMSNorm,
-    QueryKeyProjection, RotaryProjection,
+    QueryKeyProjection, RMSNorm, RotaryProjection, TransformerEncoder,
 )
 
 
-def _build_projector(in_dim: int, hidden: List[int]) -> nn.Sequential:
-    """Standard SSL projector: Linear -> BN -> ELU stacks ending in a bare Linear."""
-    sizes = [in_dim] + list(hidden)
-    layers = []
-    for i, (h1, h2) in enumerate(zip(sizes[:-1], sizes[1:])):
-        layers.append(nn.Linear(h1, h2))
-        if i != len(sizes) - 2:
-            layers.append(nn.BatchNorm1d(h2))
-            layers.append(nn.ELU())
-    return nn.Sequential(*layers)
-
-
 def _build_rope_encoder(d_model: int, num_heads: int, num_layers: int) -> TransformerEncoder:
-    """uni2ts-derived encoder: GQA(MHA) + GLU FFN + RMSNorm + RoPE.
+    """uni2ts-derived encoder: GQA + GLU FFN + RMSNorm + RoPE.
 
-    PhysioME uses ``d_cond=0`` so layer norms are plain RMSNorm (no AdaLN).
-    RoPE handles arbitrary sequence lengths natively — Phase-1 (60 s)
-    checkpoints transfer to Phase-2 windows of any length without any
-    interpolation step.
+    Phase-1 (60 s) checkpoints transfer to Phase-2 windows of any length
+    without an absolute-pos-embed interpolation step because RoPE handles
+    arbitrary sequence lengths natively.
     """
     return TransformerEncoder(
         d_model=d_model,
@@ -50,315 +65,32 @@ def _build_rope_encoder(d_model: int, num_heads: int, num_layers: int) -> Transf
     )
 
 
-class NeuroNet(nn.Module):
-    """Phase-1 unimodal SSL with **Time-Frequency Consistency** (TF-C).
+def frame_size(fs: int, second: int, time_window: int, time_step: float
+               ) -> Tuple[int, int]:
+    """Closed-form ``(num_frames, window_samples)`` for the framing params.
 
-    Replaces the original SimCLR pair (mask-aug contrastive + view-pair contrastive)
-    with three TF-C losses (Zhang et al., NeurIPS 2022):
+        F = floor((size - window) / step) + 1   if size >= window else 0
+    """
+    size = fs * second
+    step = int(time_step * fs)
+    window = int(time_window * fs)
+    if size < window:
+        return 0, window
+    num_frames = (size - window) // step + 1
+    return num_frames, window
 
-      * ``L_T`` — time-domain contrastive between two random masks of the same input
-      * ``L_F`` — frequency-domain contrastive between two random masks of |FFT(x)|
-      * ``L_TF`` — cross-domain alignment between the time-CLS and freq-CLS tokens
 
-    Architecture: separate ``frame_backbone`` for time and freq inputs (different
-    distributions / BN statistics), but **shared autoencoder** (patch_embed +
-    transformer encoder + cls_token) — that shared encoder is the universal
-    representation Phase-2 transfers down. The freq-magnitude vector is zero-padded
-    up to the time window length so a single backbone architecture can be reused.
+class BiosignalEncoder(nn.Module):
+    """Encoder used by both Phase-1 SSL and Phase-2 backbone reuse.
 
-    Reconstruction (MAE) is still computed on both domains; the total Phase-1
-    loss is ``recon + L_T + L_F + L_TF``.
+    Output shape is ``[B, num_frames + 1, encoder_embed_dim]`` with the
+    leading position being the CLS token. ``frame_step`` and frame size are
+    derived from ``(fs, time_window, time_step)`` via :func:`frame_size`.
     """
 
     def __init__(self, fs: int, second: int, time_window: int, time_step: float,
-                 encoder_embed_dim, encoder_heads: int, encoder_depths: int,
-                 decoder_embed_dim: int, decoder_heads: int, decoder_depths: int,
-                 projection_hidden: List, temperature=0.01):
-        super().__init__()
-        self.fs, self.second = fs, second
-        self.time_window = time_window
-        self.time_step = time_step
-        self.window_samples = int(time_window * fs)
-        self.frame_step = int(time_step * fs)
-
-        self.num_patches, _ = frame_size(fs=fs, second=second, time_window=time_window, time_step=time_step)
-        # Time-domain backbone (raw waveform per frame).
-        self.frame_backbone = FrameBackBone(fs=self.fs, window=self.time_window)
-        # Frequency-domain backbone (|FFT| magnitude per frame, zero-padded to W).
-        self.frame_backbone_freq = FrameBackBone(fs=self.fs, window=self.time_window)
-        # Shared autoencoder: same patch_embed / encoder / cls_token / decoder for both domains.
-        # recon_size = window_samples (W=300): decoder predicts the **raw frame** that was
-        # fed into frame_backbone (or its freq-domain counterpart freq_proj output), not
-        # the latent frame_backbone output. T = F * W exactly under no-overlap framing,
-        # so the per-frame raw target is dimensionally equivalent to the original signal.
-        self.autoencoder = MaskedAutoEncoderViT(input_size=self.frame_backbone.feature_num,
-                                                recon_size=self.window_samples,
-                                                encoder_embed_dim=encoder_embed_dim, num_patches=self.num_patches,
-                                                encoder_heads=encoder_heads, encoder_depths=encoder_depths,
-                                                decoder_embed_dim=decoder_embed_dim, decoder_heads=decoder_heads,
-                                                decoder_depths=decoder_depths)
-        self.contrastive_loss = NTXentLoss(temperature=temperature, performance_view=False)
-
-        # TF-C projectors: one per loss path. Each lifts the cls token into the
-        # contrastive space. Separate projectors (not shared) per the TF-C paper.
-        self.projector_time = _build_projector(encoder_embed_dim, projection_hidden)
-        self.projector_freq = _build_projector(encoder_embed_dim, projection_hidden)
-        self.projector_tfc = _build_projector(encoder_embed_dim, projection_hidden)
-
-        # Learned lift from |FFT| magnitude (W//2+1) up to the time-window length
-        # (W) so ``frame_backbone_freq`` (which is shape-locked to W=fs*time_window)
-        # can ingest the freq view without zero-padding artifacts.
-        window = int(time_window * fs)
-        self.freq_proj = nn.Linear(window // 2 + 1, window)
-
-        # Per-patch normalization stabilises raw-signal MAE (BFM / original MAE
-        # paper default). Without it the loss is dominated by per-patch DC offset.
-        self.norm_pix_loss = True
-
-    # ------------------------------------------------------------------
-    # View construction
-    # ------------------------------------------------------------------
-    def _frames_time(self, x: torch.Tensor) -> torch.Tensor:
-        """Slice waveform into overlapping time-domain frames."""
-        return self.make_frame(x)
-
-    def _frames_freq(self, frames_time: torch.Tensor) -> torch.Tensor:
-        """|FFT| magnitude per frame, lifted by a learned linear projection
-        from W//2+1 up to W so the frame_backbone_freq architecture (which
-        is shape-locked to W = fs * time_window) can ingest both domains
-        without the structural-zero artifacts of zero-padding."""
-        mag = torch.fft.rfft(frames_time, dim=-1).abs()        # (B, F, W//2+1)
-        return self.freq_proj(mag)                             # (B, F, W)
-
-    # ------------------------------------------------------------------
-    # Forward (TF-C 3-loss + reconstruction)
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor, mask_ratio: float = 0.5):
-        # 1. Build time / freq views.
-        frames_t = self._frames_time(x)                         # (B, F, W)
-        frames_f = self._frames_freq(frames_t)                  # (B, F, W)
-        feat_t = self.frame_backbone(frames_t)                  # (B, F, D)
-        feat_f = self.frame_backbone_freq(frames_f)             # (B, F, D)
-
-        # 2. Two random-masked passes per view -> v1 (with reconstruction) and v2.
-        latent_t1, pred_t1, mask_t1 = self.autoencoder(feat_t, mask_ratio)
-        latent_t2 = self.autoencoder.forward_encoder(feat_t, mask_ratio)[0]
-        latent_f1, pred_f1, mask_f1 = self.autoencoder(feat_f, mask_ratio)
-        latent_f2 = self.autoencoder.forward_encoder(feat_f, mask_ratio)[0]
-
-        # 3. MAE reconstruction loss on both domains -- raw signal target.
-        # Time view: predict frames_t (raw [B,F,W] window samples).
-        # Freq view: predict frames_f (freq_proj(|FFT|) input to freq backbone).
-        # Both [B,F,W=300]. Decoder Linear(decoder_embed_dim, W) outputs the same shape.
-        recon_loss = self.forward_mae_loss(frames_t, pred_t1, mask_t1) \
-                   + self.forward_mae_loss(frames_f, pred_f1, mask_f1)
-
-        # 4. CLS tokens.
-        o_t1, o_t2 = latent_t1[:, 0, :], latent_t2[:, 0, :]
-        o_f1, o_f2 = latent_f1[:, 0, :], latent_f2[:, 0, :]
-
-        # 5. L_T: time-domain NT-Xent between the two masked views.
-        l_t = self.contrastive_loss(self.projector_time(o_t1),
-                                    self.projector_time(o_t2))
-
-        # 6. L_F: frequency-domain NT-Xent between the two masked views.
-        l_f = self.contrastive_loss(self.projector_freq(o_f1),
-                                    self.projector_freq(o_f2))
-
-        # 7. L_TF: cross-domain alignment (time CLS vs freq CLS, same instance).
-        l_tf = self.contrastive_loss(self.projector_tfc(o_t1),
-                                     self.projector_tfc(o_f1))
-
-        return recon_loss, l_t, l_f, l_tf
-
-    # ------------------------------------------------------------------
-    # Inference helpers (used by Phase-2 / probes)
-    # ------------------------------------------------------------------
-    def forward_latent(self, x: torch.Tensor, global_tokens=False):
-        """Time-domain encoder output for downstream / Phase-2 transfer.
-        The frequency path is Phase-1 only — Phase-2 (PhysioME) inherits
-        ``frame_backbone`` and ``autoencoder`` and discards ``frame_backbone_freq``
-        and the three projectors."""
-        x = self.make_frame(x)
-        x = self.frame_backbone(x)
-        latent = self.autoencoder.forward_encoder(x, mask_ratio=0)[0]
-        if global_tokens:
-            return latent
-        return latent[:, :1, :].squeeze()
-
-    @torch.no_grad()
-    def forward_recon_time(self, x: torch.Tensor, mask_ratio: float = 0.5):
-        """Visualization helper. Mirrors the time-view path of ``forward()`` but
-        returns frame-level tensors instead of scalar losses, so a training
-        loop can plot real-vs-predicted waveforms periodically.
-
-        Returns:
-            real_frames : ``[B, F, W]`` raw time-domain frames.
-            pred_frames : ``[B, F, W]`` decoder output, **de-normalised** back
-                          to raw-signal scale using each patch's (mean, var)
-                          when ``norm_pix_loss`` is on. This matches what the
-                          model is implicitly predicting at loss time and makes
-                          the plot directly comparable to ``real_frames``.
-            mask        : ``[B, F]`` 1 where the patch was masked.
-        """
-        was_training = self.training
-        self.eval()
-        frames_t = self._frames_time(x)                     # (B, F, W)
-        feat_t = self.frame_backbone(frames_t)              # (B, F, D)
-        _, pred_t, mask_t = self.autoencoder(feat_t, mask_ratio)
-        if self.norm_pix_loss:
-            mean = frames_t.mean(dim=-1, keepdim=True)
-            var = frames_t.var(dim=-1, keepdim=True)
-            pred_t = pred_t * (var + 1.e-6).sqrt() + mean
-        if was_training:
-            self.train()
-        return frames_t, pred_t, mask_t
-
-    def forward_mae_loss(self,
-                         real: torch.Tensor,
-                         pred: torch.Tensor,
-                         mask: torch.Tensor):
-
-        if self.norm_pix_loss:
-            mean = real.mean(dim=-1, keepdim=True)
-            var = real.var(dim=-1, keepdim=True)
-            real = (real - mean) / (var + 1.e-6) ** .5
-
-        loss = (pred - real) ** 2
-        loss = loss.mean(dim=-1)
-        loss = (loss * mask).sum() / mask.sum()
-        return loss
-
-    def make_frame(self, x):
-        """Slice ``[B, T]`` into ``[B, F, W]`` frames via ``Tensor.unfold``.
-
-        Vectorised replacement for the prior Python for-loop + torch.stack
-        implementation. For non-overlap framing (``time_step == time_window``)
-        ``unfold`` returns a contiguous view; ``.contiguous()`` is a no-op there
-        and a single bulk copy in the overlap case.
-        """
-        return x.unfold(
-            dimension=-1, size=self.window_samples, step=self.frame_step,
-        ).contiguous()
-
-
-class MaskedAutoEncoderViT(nn.Module):
-    def __init__(self, input_size: int, num_patches: int,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
-                 decoder_embed_dim: int, decoder_heads: int, decoder_depths: int,
-                 recon_size: int = None):
-        super().__init__()
-        self.patch_embed = nn.Linear(input_size, encoder_embed_dim)
-        # recon_size: output dim of decoder_pred. Defaults to input_size for
-        # backward compatibility (latent self-distillation); pass W=window_samples
-        # to switch to raw-signal reconstruction (current NeuroNet default).
-        if recon_size is None:
-            recon_size = input_size
-        self.recon_size = recon_size
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
-        self.embed_dim = encoder_embed_dim
-        self.encoder_depths = encoder_depths
-
-        # MAE Encoder — uni2ts-derived TransformerEncoder (GQA + GLU FFN + RMSNorm + RoPE).
-        # final norm is folded into the encoder; we expose ``encoder_norm`` as an alias for
-        # backwards-compat with checkpoints/utilities that look for it by name.
-        self.encoder = _build_rope_encoder(
-            d_model=encoder_embed_dim, num_heads=encoder_heads, num_layers=encoder_depths,
-        )
-        self.encoder_norm = self.encoder.norm
-
-        # MAE Decoder — uni2ts-derived TransformerEncoder (GQA + GLU FFN +
-        # RMSNorm + RoPE), matching the encoder. RoPE handles positions inside
-        # attention, so no additive ``decoder_pos_embed`` is needed; the final
-        # RMSNorm is folded into the encoder block (no separate ``decoder_norm``).
-        self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder = _build_rope_encoder(
-            d_model=decoder_embed_dim, num_heads=decoder_heads, num_layers=decoder_depths,
-        )
-        self.decoder_pred = nn.Linear(decoder_embed_dim, recon_size, bias=True)
-        self.initialize_weights()
-
-    def forward(self, x, mask_ratio=0.8):
-        latent, mask, ids_restore = self.forward_encoder(x, mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)
-        return latent, pred, mask
-
-    def forward_encoder(self, x: torch.Tensor, mask_ratio: float = 0.5):
-        # embed patches (RoPE applies position info inside attention; no additive pos_embed here)
-        x = self.patch_embed(x)
-
-        # masking: length -> length * mask_ratio
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
-
-        # prepend cls token
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        # apply Transformer encoder (RoPE inside attention; final RMSNorm folded in)
-        x = self.encoder(x)
-        return x, mask, ids_restore
-
-    def forward_decoder(self, x, ids_restore: torch.Tensor):
-        # embed tokens
-        x = self.decoder_embed(x[:, 1:, :])
-
-        # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)  # no cls token
-        x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-
-        # apply Transformer decoder (RoPE inside attention; final RMSNorm folded in)
-        x = self.decoder(x)
-
-        # predictor projection
-        x = self.decoder_pred(x)
-        return x
-
-    @staticmethod
-    def random_masking(x, mask_ratio):
-        n, l, d = x.shape  # batch, length, dim
-        len_keep = int(l * (1 - mask_ratio))
-
-        noise = torch.rand(n, l, device=x.device)  # noise in [0, 1]
-
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        # keep the first subset
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, d))
-
-        # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([n, l], device=x.device)
-        mask[:, :len_keep] = 0
-
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-        return x_masked, mask, ids_restore
-
-    def initialize_weights(self):
-        # RoPE inside both encoder and decoder attention -> no additive position
-        # tables to seed. Just initialise the learned token parameters.
-        torch.nn.init.normal_(self.cls_token, std=.02)
-        torch.nn.init.normal_(self.mask_token, std=.02)
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
-            torch.nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-
-class NeuroNetEncoder(nn.Module):
-    def __init__(self, fs: int, second: int, time_window: int, time_step: float,
-                 encoder_embed_dim: int, encoder_heads: int, encoder_depths: int):
+                 freeze_cls_token: bool = False):
         super().__init__()
         self.fs, self.second = fs, second
         self.time_window, self.time_step = time_window, time_step
@@ -374,59 +106,337 @@ class NeuroNetEncoder(nn.Module):
 
         self.frame_backbone = FrameBackBone(fs=fs, window=time_window)
         self.patch_embed = nn.Linear(self.frame_backbone.feature_num, encoder_embed_dim)
-        # uni2ts-derived encoder: GQA + GLU FFN + RMSNorm + RoPE.
-        # Variable input length is supported natively (no pos_embed table to interpolate).
         self.encoder = _build_rope_encoder(
-            d_model=encoder_embed_dim, num_heads=encoder_heads, num_layers=encoder_depths,
+            d_model=encoder_embed_dim,
+            num_heads=encoder_heads,
+            num_layers=encoder_depths,
         )
         self.encoder_norm = self.encoder.norm  # alias for ckpt-loading utilities
         self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
-        # Match the original "frozen at init" behavior — cls_token is loaded from
-        # the Phase-1 NeuroNet checkpoint and not updated during Phase-2 training.
-        self.cls_token.requires_grad = False
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        if freeze_cls_token:
+            self.cls_token.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.make_frame(x)
-        x = self.frame_backbone(x)
-        x = self.patch_embed(x)
-
-        # Prepend cls token; positions are injected inside attention via RoPE.
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        x = self.encoder(x)
-        return x
-
-    def make_frame(self, x):
+    def make_frame(self, x: torch.Tensor) -> torch.Tensor:
         """Slice ``[B, T]`` into ``[B, F, W]`` frames via ``Tensor.unfold``."""
         return x.unfold(
             dimension=-1, size=self.window_samples, step=self.frame_step,
         ).contiguous()
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.make_frame(x)
+        x = self.frame_backbone(x)
+        x = self.patch_embed(x)
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = self.encoder(x)
+        return x
 
-def frame_size(fs, second, time_window, time_step):
-    """Closed-form ``(num_frames, window_samples)`` for the framing parameters.
 
-    Replaces the previous loop + ``np.stack`` shape probe — pure arithmetic,
-    no allocation. ``num_frames`` matches both the prior loop implementation
-    and ``Tensor.unfold(dim=-1, size=window, step=step)``:
+# ─────────────────────────────────────────────────────────────────────
+# BiosignalDINO (Phase-1 SSL wrapper)
+# ─────────────────────────────────────────────────────────────────────
 
-        F = floor((size - window) / step) + 1   if size >= window else 0
+
+def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad = requires_grad
+
+
+@torch.no_grad()
+def _ema_copy(target: nn.Module, source: nn.Module, momentum: float) -> None:
+    for p_t, p_s in zip(target.parameters(), source.parameters()):
+        p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
+    for b_t, b_s in zip(target.buffers(), source.buffers()):
+        b_t.data.copy_(b_s.data)
+
+
+class BiosignalDINO(nn.Module):
+    """DINOv3-style self-distillation for unimodal biosignal SSL.
+
+    Forward consumes a multi-crop bundle (globals + locals) and returns the
+    total SSL loss plus a dict of unweighted sub-losses for logging. The
+    teacher network and centering buffer are owned here.
+
+    Loss = dino_weight * L_dino + ibot_weight * L_ibot
+
+      L_dino: each *student* view (global or local) predicts the sharpened-
+              and-centered distribution emitted by every *teacher* global
+              view, except the same-crop pairing. Mean over pairs.
+      L_ibot: random patch positions in each student global crop are
+              replaced by a learnable mask token. At those positions, the
+              student predicts the teacher's per-patch distribution at the
+              same positions on the unmasked input. Off when ``ibot_weight=0``.
+
+    Centering: a running mean of the raw teacher prototype logits is kept
+    on-device and subtracted before sharpening. Updated via
+    :meth:`update_center` after each forward.
     """
-    size = fs * second
-    step = int(time_step * fs)
-    window = int(time_window * fs)
-    if size < window:
-        return 0, window
-    num_frames = (size - window) // step + 1
-    return num_frames, window
+
+    def __init__(self,
+                 fs: int, second: int, time_window: int, time_step: float,
+                 encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
+                 head_hidden_dim: int = 2048,
+                 head_bottleneck_dim: int = 256,
+                 head_n_prototypes: int = 8192,
+                 head_n_layers: int = 3,
+                 student_temp: float = 0.1,
+                 teacher_temp: float = 0.04,
+                 center_momentum: float = 0.9,
+                 ibot_weight: float = 1.0,
+                 ibot_mask_ratio: float = 0.3,
+                 dino_weight: float = 1.0):
+        super().__init__()
+        self.student_encoder = BiosignalEncoder(
+            fs=fs, second=second,
+            time_window=time_window, time_step=time_step,
+            encoder_embed_dim=encoder_embed_dim,
+            encoder_heads=encoder_heads,
+            encoder_depths=encoder_depths,
+            freeze_cls_token=False,
+        )
+        self.student_head = DINOHead(
+            in_dim=encoder_embed_dim,
+            hidden_dim=head_hidden_dim,
+            bottleneck_dim=head_bottleneck_dim,
+            n_prototypes=head_n_prototypes,
+            n_layers=head_n_layers,
+        )
+
+        # Teacher: deep-copied at init, then EMA-updated from the student.
+        # Frozen w.r.t. autograd (the no_grad on update + here is belt-and-suspenders).
+        self.teacher_encoder = copy.deepcopy(self.student_encoder)
+        self.teacher_head = copy.deepcopy(self.student_head)
+        _set_requires_grad(self.teacher_encoder, False)
+        _set_requires_grad(self.teacher_head, False)
+
+        # iBOT mask token applied at patch-embedded positions (post patch_embed).
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        self.register_buffer(
+            'center', torch.zeros(1, head_n_prototypes),
+        )
+
+        self.student_temp = float(student_temp)
+        self.teacher_temp = float(teacher_temp)
+        self.center_momentum = float(center_momentum)
+        self.ibot_weight = float(ibot_weight)
+        self.ibot_mask_ratio = float(ibot_mask_ratio)
+        self.dino_weight = float(dino_weight)
+        self.n_prototypes = int(head_n_prototypes)
+
+    # ─────────────────────────────────────────────────────────────
+    # Encoder helpers (also used by probe code via forward_latent)
+    # ─────────────────────────────────────────────────────────────
+
+    def forward_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """Single-crop CLS latent for downstream probing.
+
+        Returns ``[B, encoder_embed_dim]`` — the CLS token output of the
+        student encoder. Run under no_grad; caller is responsible for
+        ``self.eval()``.
+        """
+        z = self.student_encoder(x)
+        return z[:, 0, :]
+
+    # ─────────────────────────────────────────────────────────────
+    # Loss-side forward (used during training)
+    # ─────────────────────────────────────────────────────────────
+
+    def _encode_globals_masked(self, globals_: torch.Tensor
+                               ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Student forward on global crops with iBOT-style patch masking.
+
+        Returns:
+            cls_logits  : [n_g * B, K]       — CLS prototype logits
+            patch_logits: [n_g * B, F, K] — per-patch prototype logits
+                          (used only at masked positions for L_ibot)
+            patch_mask  : [n_g * B, F]   bool — True at masked positions
+        """
+        enc = self.student_encoder
+        x = enc.make_frame(globals_)
+        x = enc.frame_backbone(x)
+        x = enc.patch_embed(x)  # [n_g * B, F, D]
+        n, f, d = x.shape
+
+        if self.ibot_weight > 0 and self.ibot_mask_ratio > 0:
+            mask_prob = torch.full((n, f), self.ibot_mask_ratio, device=x.device)
+            patch_mask = torch.bernoulli(mask_prob).bool()
+            x = torch.where(patch_mask.unsqueeze(-1), self.mask_token, x)
+        else:
+            patch_mask = torch.zeros((n, f), dtype=torch.bool, device=x.device)
+
+        cls_tokens = enc.cls_token.expand(n, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = enc.encoder(x)
+        cls_feat, patch_feat = x[:, 0, :], x[:, 1:, :]
+        cls_logits = self.student_head(cls_feat)
+        if self.ibot_weight > 0:
+            patch_logits = self.student_head(patch_feat.reshape(n * f, d)).reshape(n, f, -1)
+        else:
+            patch_logits = patch_feat.new_zeros((n, f, self.n_prototypes))
+        return cls_logits, patch_logits, patch_mask
+
+    def _encode_locals(self, locals_: torch.Tensor) -> torch.Tensor:
+        """Student forward on local crops — CLS only. ``[n_l * B, K]``."""
+        if locals_.shape[0] == 0:
+            return locals_.new_zeros((0, self.n_prototypes))
+        z = self.student_encoder(locals_)
+        return self.student_head(z[:, 0, :])
+
+    @torch.no_grad()
+    def _encode_teacher(self, globals_: torch.Tensor
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher forward on globals — CLS + per-patch logits.
+
+        Returns:
+            cls_logits  : [n_g * B, K]
+            patch_logits: [n_g * B, F, K]
+        """
+        z = self.teacher_encoder(globals_)
+        cls_feat, patch_feat = z[:, 0, :], z[:, 1:, :]
+        cls_logits = self.teacher_head(cls_feat)
+        if self.ibot_weight > 0:
+            n, f, d = patch_feat.shape
+            patch_logits = self.teacher_head(patch_feat.reshape(n * f, d)).reshape(n, f, -1)
+        else:
+            patch_logits = patch_feat.new_zeros(
+                (patch_feat.shape[0], patch_feat.shape[1], self.n_prototypes)
+            )
+        return cls_logits, patch_logits
+
+    def forward(self,
+                globals_: torch.Tensor,
+                locals_: torch.Tensor,
+                n_global: int,
+                n_local: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Multi-crop self-distillation forward.
+
+        Args:
+            globals_: ``[n_global * B, T_g]`` (crops cat'd on batch axis,
+                      crop-major: first B rows are crop 0, next B are crop 1, ...).
+            locals_ : ``[n_local  * B, T_l]`` with same crop-major layout.
+        Returns:
+            loss : scalar total loss = dino_weight * L_dino + ibot_weight * L_ibot
+            logs : dict of unweighted ``dino``, ``ibot`` losses for logging.
+        """
+        if n_global < 1:
+            raise ValueError('n_global must be >= 1 for self-distillation.')
+        batch_size_g = globals_.shape[0] // n_global
+        if batch_size_g * n_global != globals_.shape[0]:
+            raise RuntimeError('globals_ batch axis is not divisible by n_global')
+
+        # Student
+        s_g_cls, s_g_patch, patch_mask = self._encode_globals_masked(globals_)
+        s_l_cls = self._encode_locals(locals_)
+
+        # Teacher (no_grad)
+        t_g_cls, t_g_patch = self._encode_teacher(globals_)
+
+        # Centering + sharpening for the teacher CLS distribution.
+        t_cls_sharp = (t_g_cls - self.center) / self.teacher_temp
+        t_cls_dist = F.softmax(t_cls_sharp, dim=-1)  # [n_g*B, K]
+
+        # Student log-softmax (full prototype distribution over K).
+        s_g_logp = F.log_softmax(s_g_cls / self.student_temp, dim=-1)
+        s_l_logp = (F.log_softmax(s_l_cls / self.student_temp, dim=-1)
+                    if s_l_cls.shape[0] > 0 else None)
+
+        # Reshape to per-crop tensors.
+        t_cls_dist_v = t_cls_dist.view(n_global, batch_size_g, -1)
+        s_g_logp_v = s_g_logp.view(n_global, batch_size_g, -1)
+        if s_l_logp is not None:
+            batch_size_l = locals_.shape[0] // max(n_local, 1)
+            s_l_logp_v = s_l_logp.view(n_local, batch_size_l, -1)
+        else:
+            s_l_logp_v = None
+
+        # ─── DINO loss: pair every teacher global with every student crop ─────
+        terms: List[torch.Tensor] = []
+        for i in range(n_global):
+            t_i = t_cls_dist_v[i]
+            # Student globals (skip same-crop pair).
+            for j in range(n_global):
+                if j == i:
+                    continue
+                terms.append(-(t_i * s_g_logp_v[j]).sum(dim=-1).mean())
+            # Student locals.
+            if s_l_logp_v is not None and n_local > 0:
+                for j in range(n_local):
+                    terms.append(-(t_i * s_l_logp_v[j]).sum(dim=-1).mean())
+        if terms:
+            loss_dino = torch.stack(terms).mean()
+        else:
+            loss_dino = globals_.new_zeros(())
+
+        # ─── iBOT loss: masked-patch prediction on student globals ────────────
+        if self.ibot_weight > 0 and patch_mask.any():
+            t_patch_sharp = (t_g_patch - self.center) / self.teacher_temp
+            t_patch_dist = F.softmax(t_patch_sharp, dim=-1)
+            s_patch_logp = F.log_softmax(s_g_patch / self.student_temp, dim=-1)
+            # Per-position CE only at masked positions.
+            ce = -(t_patch_dist * s_patch_logp).sum(dim=-1)  # [n_g*B, F]
+            mask_f = patch_mask.float()
+            denom = mask_f.sum().clamp_min(1.0)
+            loss_ibot = (ce * mask_f).sum() / denom
+        else:
+            loss_ibot = globals_.new_zeros(())
+
+        loss = self.dino_weight * loss_dino + self.ibot_weight * loss_ibot
+
+        # Centering update (raw, un-sharpened teacher logits).
+        self._update_center(t_g_cls.detach(), t_g_patch.detach() if self.ibot_weight > 0 else None)
+
+        return loss, {'dino': loss_dino.detach(),
+                      'ibot': loss_ibot.detach()}
+
+    # ─────────────────────────────────────────────────────────────
+    # EMA + centering utilities
+    # ─────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float) -> None:
+        _ema_copy(self.teacher_encoder, self.student_encoder, momentum)
+        _ema_copy(self.teacher_head, self.student_head, momentum)
+
+    @torch.no_grad()
+    def _update_center(self, t_cls: torch.Tensor,
+                       t_patch: Optional[torch.Tensor]) -> None:
+        # Combine CLS + patch (if iBOT on) into a single running mean.
+        batch_center = t_cls.mean(dim=0, keepdim=True)
+        if t_patch is not None:
+            n, f, k = t_patch.shape
+            patch_center = t_patch.reshape(n * f, k).mean(dim=0, keepdim=True)
+            batch_center = 0.5 * (batch_center + patch_center)
+        self.center.mul_(self.center_momentum).add_(
+            batch_center, alpha=1.0 - self.center_momentum,
+        )
+
+
+def cosine_schedule(start: float, end: float, step: int, total_steps: int
+                    ) -> float:
+    """Half-cosine schedule from ``start`` at step 0 to ``end`` at step ``total_steps``."""
+    if total_steps <= 0:
+        return end
+    t = min(max(step, 0), total_steps) / total_steps
+    return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+def linear_warmup(start: float, end: float, step: int, warmup_steps: int) -> float:
+    if warmup_steps <= 0 or step >= warmup_steps:
+        return end
+    return start + (end - start) * (step / warmup_steps)
 
 
 if __name__ == '__main__':
-    m0 = NeuroNet(fs=100, second=60, time_window=3, time_step=3,
-                  encoder_embed_dim=256, encoder_depths=4, encoder_heads=8,
-                  decoder_embed_dim=128, decoder_depths=2, decoder_heads=4,
-                  projection_hidden=[1024, 512])
-    recon, l_t, l_f, l_tf = m0(torch.randn((4, 6000)), mask_ratio=0.5)
-    print(f'recon={recon.item():.3f}  L_T={l_t.item():.3f}  '
-          f'L_F={l_f.item():.3f}  L_TF={l_tf.item():.3f}')
+    m = BiosignalDINO(
+        fs=100, second=60, time_window=3, time_step=3,
+        encoder_embed_dim=256, encoder_heads=8, encoder_depths=4,
+        head_n_prototypes=2048,
+    )
+    g = torch.randn(8, 6000)  # 2 globals x 4 batch
+    l = torch.randn(16, 1500)  # 4 locals x 4 batch
+    loss, logs = m(g, l, n_global=2, n_local=4)
+    print(f'loss={loss.item():.4f} dino={logs["dino"].item():.4f} '
+          f'ibot={logs["ibot"].item():.4f}')

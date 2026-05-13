@@ -14,7 +14,7 @@ import numpy as np
 import torch.optim as opt
 from models.utils import model_size
 from dataset.utils import group_cross_validation
-from models.dp_neuronet.model import NeuroNet, NeuroNetEncoder
+from models.dp_neuronet.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from pretrained.physiome.data_loader import TorchDataset
 from pretrained.physiome.probe_utils import run_probe, select_probe_subsets
@@ -218,28 +218,28 @@ class Trainer(object):
         return train_paths, val_paths, eval_paths
 
     def load_pretrained_unimodal(self, ckpt_path):
-        # 1. pretrained NeuroNet (Phase-1 unimodal MAE)
+        # 1. pretrained BiosignalDINO (Phase-1 unimodal DINOv3 SSL)
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model_parameter = ckpt['model_parameter']
-        pretrained_model = NeuroNet(**model_parameter)
-        # strict=False -- decoder layout was migrated from timm.Block to BFM
-        # TransformerEncoder; old Phase-1 ckpts lack the new decoder keys and
-        # vice versa. Phase-2 only transfers encoder + frame_backbone +
-        # cls_token, so missing/extra decoder keys are harmless here.
-        pretrained_model.load_state_dict(ckpt['model_state'], strict=False)
 
-        # 2. NeuroNetEncoder — direct submodule transfer (no name-substring magic).
-        backbone = NeuroNetEncoder(
+        # 2. BiosignalEncoder — load the standalone encoder_state saved by the
+        # Phase-1 trainer. Pre-DINOv3 ckpts are no longer supported.
+        backbone = BiosignalEncoder(
             fs=model_parameter['fs'], second=model_parameter['second'],
-            time_window=model_parameter['time_window'], time_step=model_parameter['time_step'],
+            time_window=model_parameter['time_window'],
+            time_step=model_parameter['time_step'],
             encoder_embed_dim=model_parameter['encoder_embed_dim'],
             encoder_heads=model_parameter['encoder_heads'],
             encoder_depths=model_parameter['encoder_depths'],
         )
-        backbone.frame_backbone.load_state_dict(pretrained_model.frame_backbone.state_dict())
-        backbone.patch_embed.load_state_dict(pretrained_model.autoencoder.patch_embed.state_dict())
-        backbone.encoder.load_state_dict(pretrained_model.autoencoder.encoder.state_dict())
-        backbone.cls_token = pretrained_model.autoencoder.cls_token
+        if 'encoder_state' in ckpt:
+            backbone.load_state_dict(ckpt['encoder_state'], strict=True)
+        else:
+            raise RuntimeError(
+                f'Checkpoint {ckpt_path!r} has no "encoder_state" key. '
+                'Pre-DINOv3 (NeuroNet/TF-C) ckpts are no longer supported — '
+                'retrain Phase-1 with the BiosignalDINO trainer.'
+            )
 
         # 3. Hand-rolled LoRA on the GQA output projection (Hu et al. 2021 + rsLoRA).
         # See ``models/transformer/lora.py`` for the rationale (drops the peft dep
