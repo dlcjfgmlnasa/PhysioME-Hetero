@@ -579,32 +579,24 @@ class Trainer:
             ax.plot(t, signal[i], color='steelblue', linewidth=0.7, alpha=0.85)
             ax.set_ylabel(f'sample {i}\n{self.modal_name}', fontsize=9)
             ax.grid(alpha=0.2)
-            # DINOv1 visualize_attention.py recipe: nearest-neighbor
-            # upsample the patch attention by ``scale_factor = time_step * fs``
-            # to recover input-sample resolution, then render as a viridis
-            # heatmap behind the signal (the equivalent of imsave(cmap=...) on
-            # the upsampled tensor). Nearest (not bilinear) is deliberate:
-            # it preserves the patch grid so the displayed resolution honestly
-            # reflects what the model actually sees.
-            stride_samples = max(1, int(round(ts * fs)))
-            upsampled = np.repeat(patch_attn[i], stride_samples)  # [n_patches * stride_samples]
-            # Pad / crop to match signal length T so x-extent aligns 1:1.
+            # DINOv3 pca.ipynb recipe: feed the raw patch grid directly to
+            # plt.imshow and let matplotlib's bilinear display interpolation
+            # smooth it. Official DINOv3 does literally
+            # ``plt.imshow(projected_image)`` on the 48x48 feature grid with
+            # ``dpi=300`` and that alone yields the "pixel-level" appearance
+            # — no pre-upsampling, no learned decoder. We feed the 58-patch
+            # row and matplotlib resamples it to whatever display size the
+            # axes occupies. ``interpolation='bilinear'`` is what does the
+            # smoothing; the data underneath stays patch-level.
             T = signal.shape[1]
-            if upsampled.shape[0] < T:
-                upsampled = np.concatenate([
-                    upsampled,
-                    np.full(T - upsampled.shape[0], upsampled[-1], dtype=upsampled.dtype),
-                ])
-            else:
-                upsampled = upsampled[:T]
             y_lo, y_hi = ax.get_ylim()
             ax.imshow(
-                upsampled[None, :],
+                patch_attn[i:i + 1],
                 aspect='auto',
                 cmap='viridis',
                 extent=[0.0, T / fs, y_lo, y_hi],
                 alpha=0.35,
-                interpolation='nearest',
+                interpolation='bilinear',
                 zorder=0,
             )
             ax.set_ylim(y_lo, y_hi)  # imshow can perturb ylim — restore
