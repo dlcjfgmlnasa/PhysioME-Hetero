@@ -269,15 +269,30 @@ def resample_to_target(signal: np.ndarray, orig_sr: float,
 
 def preprocess_channel(data: np.ndarray, signal_key: str,
                        sr: float = 100.0,
-                       cfg: Optional[SignalConfig] = None) -> np.ndarray:
+                       cfg: Optional[SignalConfig] = None,
+                       return_mask: bool = False):
     """Run the full preprocessing pipeline for one signal channel.
 
     Order: range check → spike detection → median → notch → filter.
-    Out-of-range / spike samples become NaN — downstream code is expected to
-    treat NaN as missing (e.g., zero-fill plus mask).
+
+    Two output modes:
+
+    * ``return_mask=False`` (default, SSL-parser semantics): out-of-range /
+      spike samples remain NaN in the output. The SSL segmenter relies on
+      ``np.isnan(segment).mean()`` for per-segment QC.
+
+    * ``return_mask=True`` (downstream-parser semantics): returns
+      ``(signal, artifact_mask)`` where ``signal`` is the filtered output
+      with artifact samples replaced by 0.0 (so consumers never see NaN
+      in the payload), and ``artifact_mask`` is a bool array marking the
+      sample positions that were rejected. Save the mask alongside the
+      signal so downstream tasks can either ignore those samples or
+      treat them as missing without doing NaN bookkeeping.
     """
     cfg = cfg or SIGNAL_CONFIGS.get(signal_key)
     if cfg is None:
+        if return_mask:
+            return data.astype(np.float32), np.zeros(data.shape, dtype=bool)
         return data
     out = data.astype(np.float32, copy=True)
     if cfg.valid_range is not None:
@@ -296,6 +311,13 @@ def preprocess_channel(data: np.ndarray, signal_key: str,
     if cfg.notch_freq is not None:
         out_fill = apply_notch_filter(out_fill, cfg.notch_freq, sr)
     out_fill = apply_filter(out_fill, cfg, sr)
+    if return_mask:
+        # Clean payload: zero out artifact regions. Mask preserves the
+        # location info so a downstream consumer can mask / impute / drop
+        # explicitly instead of forgetting to handle NaN.
+        out_fill = out_fill.astype(np.float32)
+        out_fill[nan_mask] = 0.0
+        return out_fill, nan_mask.astype(bool)
     # Restore NaN where original was NaN (artifact-marked stays artifact-marked).
     if nan_mask.any():
         out_fill = out_fill.astype(np.float32)

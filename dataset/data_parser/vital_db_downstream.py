@@ -7,22 +7,27 @@ downstream tasks (IOH, AKI, mortality, ...) can compute per-task labels on the
 fly with custom window / horizon settings.
 
 Output (per case, one ``.npz`` in ``trg_path``):
-    abp: float32 [N]   — preprocessed ABP at sfreq Hz, NaN where invalid
-    ecg: float32 [N]   — preprocessed ECG, ditto
-    ppg: float32 [N]   — preprocessed PPG, ditto
-    cvp: float32 [N]   — preprocessed CVP (central venous pressure), ditto
-    co2: float32 [N]   — preprocessed CO2 (capnography), ditto       (Step 3, 2026-05-09)
-    awp: float32 [N]   — preprocessed AWP (airway pressure), ditto   (Step 3, 2026-05-09)
-    spo2: float32 [N]  — pulse oximeter SpO2 (%) from Solar8000 monitor, label
-                         channel only (NOT in MODAL_ORDER); piecewise-constant
-                         resampling at sfreq Hz, NaN where invalid
+    abp: float32 [N]        — preprocessed ABP at sfreq Hz, **0.0 at artifact** samples
+    abp_mask: bool [N]      — True where the corresponding ABP sample was rejected
+                              (out-of-range / spike) and zero-filled
+    ecg / ecg_mask, ppg / ppg_mask, cvp / cvp_mask, co2 / co2_mask,
+    awp / awp_mask: same convention for the other modalities  (Step 3, 2026-05-09;
+                              mask channel added 2026-05-13 — npz no longer carries NaN)
+    spo2: float32 [N]       — pulse oximeter SpO2 (%) from Solar8000 monitor, label
+                              channel only (NOT in MODAL_ORDER); piecewise-constant
+                              resampling at sfreq Hz, 0.0 at out-of-range samples
+    spo2_mask: bool [N]     — True where the SpO2 reading was outside [50, 100] and
+                              zero-filled
     modality_present: bool [M]   — which of MODAL_ORDER exist in the recording
     label_present: bool [L]      — which of LABEL_ORDER (currently just SPO2) exist
     sfreq: int
     case_id: str
 
 Modalities not recorded in the source case are not present in the npz at all
-(use ``modality_present`` / ``label_present`` to check before indexing).
+(use ``modality_present`` / ``label_present`` to check before indexing). When a
+modality is present, both ``<modal>`` and ``<modal>_mask`` are present and have
+the same length.
+
 Modality keys / order are shared with ``vital_db_ssl.py`` via ``MODAL_ORDER``
 / ``MODAL_TO_SIGNAL_KEY`` — bumping the v2 set there propagates here for free.
 Label channels are intentionally separate so the model never sees them as inputs.
@@ -117,24 +122,34 @@ def vitaldb_downstream_converter(src_path: str, trg_path: str,
         for i, m in enumerate(present_modals):
             channel = np.asarray(data[:, i], dtype=np.float32)
             if not skip_preprocess:
-                channel = preprocess_channel(
+                channel, artifact_mask = preprocess_channel(
                     channel, signal_key=MODAL_TO_SIGNAL_KEY[m], sr=float(sfreq),
                     cfg=SIGNAL_CONFIGS[MODAL_TO_SIGNAL_KEY[m]],
+                    return_mask=True,
                 )
+            else:
+                # No preprocessing requested — still produce a mask channel so
+                # the npz schema stays uniform. Mark non-finite samples and
+                # zero them out so the payload itself contains no NaN.
+                artifact_mask = ~np.isfinite(channel)
+                channel = np.where(artifact_mask, 0.0, channel).astype(np.float32)
             save_dict[m.lower()] = channel
+            save_dict[m.lower() + '_mask'] = artifact_mask
 
         # Label channels: no signal-domain preprocessing (these are monitor-
         # derived numerics like SpO2 at 1 Hz; bandpass/notch would destroy
-        # them). Just clip to physiological range.
+        # them). Just clip to physiological range and emit a mask channel
+        # for the out-of-range samples instead of writing NaN into the payload.
         for j, lbl in enumerate(present_labels):
             channel = np.asarray(data[:, len(present_modals) + j],
                                  dtype=np.float32)
             if lbl == 'SPO2':
-                channel = np.where(
-                    (channel < 50.0) | (channel > 100.0),
-                    np.nan, channel,
-                )
+                bad = (channel < 50.0) | (channel > 100.0) | ~np.isfinite(channel)
+            else:
+                bad = ~np.isfinite(channel)
+            channel = np.where(bad, 0.0, channel).astype(np.float32)
             save_dict[lbl.lower()] = channel
+            save_dict[lbl.lower() + '_mask'] = bad.astype(bool)
 
         modality_present = np.array(
             [m in present_modals for m in MODAL_ORDER], dtype=bool,
