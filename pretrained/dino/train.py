@@ -579,23 +579,35 @@ class Trainer:
             ax.plot(t, signal[i], color='steelblue', linewidth=0.7, alpha=0.85)
             ax.set_ylabel(f'sample {i}\n{self.modal_name}', fontsize=9)
             ax.grid(alpha=0.2)
-            # Overlay CLS-to-patch attention as red shaded bands. Band width
-            # = time_step (the patch *stride*), not time_window (the patch
-            # *receptive field*) — for overlapping patches (ts < tw) the
-            # latter would smear neighbouring bands into a wash. ts-wide
-            # bands give a clean 1-bar-per-stride histogram that reflects
-            # the true attention resolution.
-            ax2 = ax.twinx()
-            max_w = max(float(patch_attn[i].max()), 1e-12)
-            for j in range(patch_attn.shape[1]):
-                t_start = j * ts
-                t_end = j * ts + ts
-                w = float(patch_attn[i, j]) / max_w
-                ax2.axvspan(t_start, t_end, ymin=0.0, ymax=w,
-                            color='crimson', alpha=0.30)
-            ax2.set_ylim(0, 1)
-            ax2.set_ylabel('CLS→patch (stride=%gs)' % ts, fontsize=8,
-                           color='crimson')
+            # DINOv1 visualize_attention.py recipe: nearest-neighbor
+            # upsample the patch attention by ``scale_factor = time_step * fs``
+            # to recover input-sample resolution, then render as a viridis
+            # heatmap behind the signal (the equivalent of imsave(cmap=...) on
+            # the upsampled tensor). Nearest (not bilinear) is deliberate:
+            # it preserves the patch grid so the displayed resolution honestly
+            # reflects what the model actually sees.
+            stride_samples = max(1, int(round(ts * fs)))
+            upsampled = np.repeat(patch_attn[i], stride_samples)  # [n_patches * stride_samples]
+            # Pad / crop to match signal length T so x-extent aligns 1:1.
+            T = signal.shape[1]
+            if upsampled.shape[0] < T:
+                upsampled = np.concatenate([
+                    upsampled,
+                    np.full(T - upsampled.shape[0], upsampled[-1], dtype=upsampled.dtype),
+                ])
+            else:
+                upsampled = upsampled[:T]
+            y_lo, y_hi = ax.get_ylim()
+            ax.imshow(
+                upsampled[None, :],
+                aspect='auto',
+                cmap='viridis',
+                extent=[0.0, T / fs, y_lo, y_hi],
+                alpha=0.35,
+                interpolation='nearest',
+                zorder=0,
+            )
+            ax.set_ylim(y_lo, y_hi)  # imshow can perturb ylim — restore
             if store_attn is not None:
                 store_total = float(store_attn[i].sum())
                 ax.text(0.99, 0.95,
