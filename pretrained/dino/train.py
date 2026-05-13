@@ -579,17 +579,23 @@ class Trainer:
             ax.plot(t, signal[i], color='steelblue', linewidth=0.7, alpha=0.85)
             ax.set_ylabel(f'sample {i}\n{self.modal_name}', fontsize=9)
             ax.grid(alpha=0.2)
-            # Overlay CLS-to-patch attention as red shaded bands.
+            # Overlay CLS-to-patch attention as red shaded bands. Band width
+            # = time_step (the patch *stride*), not time_window (the patch
+            # *receptive field*) — for overlapping patches (ts < tw) the
+            # latter would smear neighbouring bands into a wash. ts-wide
+            # bands give a clean 1-bar-per-stride histogram that reflects
+            # the true attention resolution.
             ax2 = ax.twinx()
             max_w = max(float(patch_attn[i].max()), 1e-12)
             for j in range(patch_attn.shape[1]):
                 t_start = j * ts
-                t_end = j * ts + tw
+                t_end = j * ts + ts
                 w = float(patch_attn[i, j]) / max_w
                 ax2.axvspan(t_start, t_end, ymin=0.0, ymax=w,
                             color='crimson', alpha=0.30)
             ax2.set_ylim(0, 1)
-            ax2.set_ylabel('CLS→patch', fontsize=8, color='crimson')
+            ax2.set_ylabel('CLS→patch (stride=%gs)' % ts, fontsize=8,
+                           color='crimson')
             if store_attn is not None:
                 store_total = float(store_attn[i].sum())
                 ax.text(0.99, 0.95,
