@@ -234,9 +234,12 @@ class Trainer:
         print(f'   >> DINO    : n_global={self.n_global} n_local={self.n_local} '
               f'global_samples={self.crop_cfg.global_samples} '
               f'local_samples={self.crop_cfg.local_samples}')
-        print(f'   >> Head    : prototypes={self.model.n_prototypes} '
+        print(f'   >> Head    : dino_prototypes={self.model.dino_n_prototypes} '
+              f'ibot_prototypes={self.model.ibot_n_prototypes} '
               f'ibot_weight={self.model.ibot_weight} '
-              f'ibot_mask_ratio={self.model.ibot_mask_ratio}')
+              f'ibot_mask=[{self.model.ibot_mask_ratio_min},{self.model.ibot_mask_ratio_max}] '
+              f'mask_prob={self.model.ibot_mask_sample_probability}')
+        print(f'   >> Storage : n_storage_tokens={self.model.student_encoder.n_storage_tokens}')
 
     def _build_logger(self) -> logging.Logger:
         log_dir = os.path.join(self.args.ckpt_path, self.args.model_name,
