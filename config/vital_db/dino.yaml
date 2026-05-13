@@ -47,8 +47,12 @@ clip_grad: 3.0
 # Backbone (kept identical to the prior NeuroNet encoder so Phase-2 can
 # transfer the encoder state-dict without changes).
 second: 60
+# Overlapping 3-second patches sliding every 1 second so attention has
+# 1-s temporal resolution while each patch's CNN frame backbone still
+# sees 3 cardiac cycles. With (size=6000, window=300, step=100) the
+# encoder gets (6000-300)/100+1 = 58 patches per 60-s segment.
 time_window: 3
-time_step: 3
+time_step: 1
 encoder_embed_dim: 512
 encoder_heads: 8
 encoder_depths: 6
