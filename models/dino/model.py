@@ -35,6 +35,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.dino.dino_head import DINOHead
+from models.dino.dino_loss import DINOLoss
+from models.dino.ibot_loss import iBOTPatchLoss
+from models.dino.masking import make_block_mask
 from models.dino.resnet1d import FrameBackBone
 from models.transformer import (
     QueryKeyProjection, RMSNorm, RotaryProjection, TransformerEncoder,
@@ -145,8 +148,16 @@ def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
 
 @torch.no_grad()
 def _ema_copy(target: nn.Module, source: nn.Module, momentum: float) -> None:
-    for p_t, p_s in zip(target.parameters(), source.parameters()):
-        p_t.data.mul_(momentum).add_(p_s.data, alpha=1.0 - momentum)
+    """In-place EMA: target = m*target + (1-m)*source.
+
+    Uses ``torch._foreach_*`` for the parameter update (matches
+    ``ssl_meta_arch.py:update_ema`` L713-727 in the reference).
+    """
+    t_params = [p.data for p in target.parameters()]
+    s_params = [p.data for p in source.parameters()]
+    if t_params:
+        torch._foreach_mul_(t_params, momentum)
+        torch._foreach_add_(t_params, s_params, alpha=1.0 - momentum)
     for b_t, b_s in zip(target.buffers(), source.buffers()):
         b_t.data.copy_(b_s.data)
 
@@ -246,7 +257,16 @@ class BiosignalDINO(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        self.student_temp = float(student_temp)
+        # Losses (reference: dinov3/loss/{dino_clstoken_loss, ibot_patch_loss}.py)
+        self.dino_loss = DINOLoss(
+            out_dim=dino_head_n_prototypes,
+            student_temp=student_temp,
+        )
+        self.ibot_loss = iBOTPatchLoss(
+            patch_out_dim=ibot_head_n_prototypes,
+            student_temp=student_temp,
+        )
+
         self.teacher_temp = float(teacher_temp)
         self.dino_weight = float(dino_weight)
         self.ibot_weight = float(ibot_weight)
@@ -277,46 +297,6 @@ class BiosignalDINO(nn.Module):
     # Loss-side forward (used during training)
     # ─────────────────────────────────────────────────────────────
 
-    # ─── iBOT block-mask generator (BEiT-style) ─────────────────────────
-    def _build_ibot_block_mask(self, n_crops: int, n_patches: int,
-                               device: torch.device) -> torch.Tensor:
-        """Per-crop block-wise mask in ``[ibot_mask_ratio_min, _max]``.
-
-        Only ``ibot_mask_sample_probability`` of the ``n_crops`` global crops
-        get a non-empty mask; the rest get all-False. For each masked crop,
-        the target ratio is drawn uniformly from ``[min, max]`` and filled
-        by a single contiguous block of patches at a random offset (1-D
-        analogue of BEiT's 2-D block sampling; for short patch sequences a
-        single block is plenty — 8 patches at most for a 60s global crop
-        downsampled to 20 frames means even one block covers the full
-        ``[0.1, 0.5]`` range).
-        """
-        mask = torch.zeros((n_crops, n_patches), dtype=torch.bool, device=device)
-        if (self.ibot_weight <= 0
-                or self.ibot_mask_sample_probability <= 0
-                or n_patches <= 0):
-            return mask
-        n_masked = int(round(n_crops * self.ibot_mask_sample_probability))
-        if n_masked <= 0:
-            return mask
-        # Which crops get masked? Pick the first n_masked after a random shuffle.
-        perm = torch.randperm(n_crops, device=device)
-        masked_idx = perm[:n_masked]
-        # Spread mask ratios linearly across the masked crops, like
-        # ``MaskingGenerator`` in dinov3/data/collate.py L40-58.
-        ratios = torch.linspace(
-            self.ibot_mask_ratio_min, self.ibot_mask_ratio_max,
-            steps=n_masked + 1, device=device,
-        )[1:]
-        for k, idx in enumerate(masked_idx.tolist()):
-            n_mask_tokens = max(self.ibot_min_block_size,
-                                int(round(float(ratios[k]) * n_patches)))
-            n_mask_tokens = min(n_mask_tokens, n_patches)
-            start = int(torch.randint(0, n_patches - n_mask_tokens + 1,
-                                      (1,), device=device).item())
-            mask[idx, start:start + n_mask_tokens] = True
-        return mask
-
     def _encode_globals_masked(self, globals_: torch.Tensor
                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Student forward on global crops with BEiT-style block masking.
@@ -332,7 +312,16 @@ class BiosignalDINO(nn.Module):
         x = enc.patch_embed(x)  # [n_g * B, F, D]
         n, f, d = x.shape
 
-        patch_mask = self._build_ibot_block_mask(n, f, x.device)
+        patch_mask = make_block_mask(
+            n_crops=n, n_patches=f,
+            mask_ratio_min=self.ibot_mask_ratio_min,
+            mask_ratio_max=self.ibot_mask_ratio_max,
+            mask_sample_probability=(
+                self.ibot_mask_sample_probability if self.ibot_weight > 0 else 0.0
+            ),
+            min_block_size=self.ibot_min_block_size,
+            device=x.device,
+        )
         if patch_mask.any():
             x = torch.where(patch_mask.unsqueeze(-1), self.mask_token, x)
 
@@ -379,33 +368,6 @@ class BiosignalDINO(nn.Module):
             )
         return cls_logits, patch_logits
 
-    @staticmethod
-    @torch.no_grad()
-    def _sinkhorn_knopp(logits: torch.Tensor, eps: float,
-                        n_iters: int) -> torch.Tensor:
-        """Sinkhorn-Knopp soft assignment over the prototype axis.
-
-        ``logits``: ``[N, K]`` teacher prototype logits.
-        Returns ``[N, K]`` non-negative matrix Q whose rows sum to 1 and
-        whose columns sum to N/K (i.e. the prototype-marginal target),
-        suitable for use as the teacher's distribution in cross-entropy.
-        Matches the single-GPU version of
-        ``dinov3/loss/dino_clstoken_loss.sinkhorn_knopp_teacher``.
-        """
-        Q = torch.exp(logits / eps).t()  # [K, N]
-        n_samples = Q.shape[1]
-        n_prototypes = Q.shape[0]
-        sum_Q = Q.sum()
-        Q /= sum_Q
-        for _ in range(n_iters):
-            sum_of_rows = Q.sum(dim=1, keepdim=True)
-            Q /= sum_of_rows
-            Q /= n_prototypes
-            Q /= Q.sum(dim=0, keepdim=True)
-            Q /= n_samples
-        Q *= n_samples
-        return Q.t()  # [N, K]
-
     def forward(self,
                 globals_: torch.Tensor,
                 locals_: torch.Tensor,
@@ -423,8 +385,7 @@ class BiosignalDINO(nn.Module):
         """
         if n_global < 1:
             raise ValueError('n_global must be >= 1 for self-distillation.')
-        batch_size_g = globals_.shape[0] // n_global
-        if batch_size_g * n_global != globals_.shape[0]:
+        if globals_.shape[0] % n_global != 0:
             raise RuntimeError('globals_ batch axis is not divisible by n_global')
 
         # Student forward (with iBOT block mask) + locals.
@@ -435,59 +396,32 @@ class BiosignalDINO(nn.Module):
         t_g_cls, t_g_patch = self._encode_teacher(globals_)
 
         # Sinkhorn-Knopp normalisation on teacher CLS logits.
-        t_cls_dist = self._sinkhorn_knopp(
-            t_g_cls.float(), eps=self.teacher_temp, n_iters=self.sinkhorn_n_iters,
+        t_cls_dist = self.dino_loss.sinkhorn_knopp_teacher(
+            t_g_cls, teacher_temp=self.teacher_temp,
+            n_iterations=self.sinkhorn_n_iters,
         ).to(t_g_cls.dtype)
 
-        # Student log-softmax.
-        s_g_logp = F.log_softmax(s_g_cls / self.student_temp, dim=-1)
-        s_l_logp = (F.log_softmax(s_l_cls / self.student_temp, dim=-1)
-                    if s_l_cls.shape[0] > 0 else None)
+        loss_dino = self.dino_loss(
+            student_global_logits=s_g_cls,
+            student_local_logits=s_l_cls,
+            teacher_global_distribution=t_cls_dist,
+            n_global=n_global,
+            n_local=n_local,
+            ignore_diagonal=True,
+        )
 
-        # Reshape per-crop.
-        t_cls_dist_v = t_cls_dist.view(n_global, batch_size_g, -1)
-        s_g_logp_v = s_g_logp.view(n_global, batch_size_g, -1)
-        if s_l_logp is not None:
-            batch_size_l = locals_.shape[0] // max(n_local, 1)
-            s_l_logp_v = s_l_logp.view(n_local, batch_size_l, -1)
-        else:
-            s_l_logp_v = None
-
-        # ─── DINO loss: every teacher global pairs with every student crop ─────
-        terms: List[torch.Tensor] = []
-        for i in range(n_global):
-            t_i = t_cls_dist_v[i]
-            # Student globals (skip i==j same-view pair).
-            for j in range(n_global):
-                if j == i:
-                    continue
-                terms.append(-(t_i * s_g_logp_v[j]).sum(dim=-1).mean())
-            if s_l_logp_v is not None and n_local > 0:
-                for j in range(n_local):
-                    terms.append(-(t_i * s_l_logp_v[j]).sum(dim=-1).mean())
-        loss_dino = (torch.stack(terms).mean()
-                     if terms else globals_.new_zeros(()))
-
-        # ─── iBOT loss: per-image-normalised, averaged over all globals ────────
         if self.ibot_weight > 0 and patch_mask.any():
-            ng, fp = patch_mask.shape  # [n_g*B, F]
-            t_patch_flat = t_g_patch.reshape(ng * fp, -1).float()
-            t_patch_dist = self._sinkhorn_knopp(
-                t_patch_flat, eps=self.teacher_temp,
-                n_iters=self.sinkhorn_n_iters,
+            ng, fp = patch_mask.shape
+            t_patch_flat = t_g_patch.reshape(ng * fp, -1)
+            t_patch_dist = self.ibot_loss.sinkhorn_knopp_teacher(
+                t_patch_flat, teacher_temp=self.teacher_temp,
+                n_iterations=self.sinkhorn_n_iters,
             ).to(t_g_patch.dtype).reshape(ng, fp, -1)
-            s_patch_logp = F.log_softmax(s_g_patch / self.student_temp, dim=-1)
-
-            # Per-patch CE, then per-image inverse-mask-count weighting,
-            # then average over ALL global crops (unmasked ones contribute 0).
-            ce = -(t_patch_dist * s_patch_logp).sum(dim=-1)  # [n_g*B, F]
-            mask_f = patch_mask.float()
-            n_masked_per_image = mask_f.sum(dim=-1).clamp_min(1.0)  # [n_g*B]
-            per_image = (ce * mask_f).sum(dim=-1) / n_masked_per_image
-            # Zero out rows that had no mask so they contribute 0 but still
-            # count in the denominator.
-            per_image = per_image * (mask_f.sum(dim=-1) > 0).float()
-            loss_ibot = per_image.sum() / ng
+            loss_ibot = self.ibot_loss.forward_masked(
+                student_patch_logits=s_g_patch,
+                teacher_patch_distribution=t_patch_dist,
+                patch_mask=patch_mask,
+            )
         else:
             loss_ibot = globals_.new_zeros(())
 
@@ -508,7 +442,7 @@ class BiosignalDINO(nn.Module):
 
 def cosine_schedule(start: float, end: float, step: int, total_steps: int
                     ) -> float:
-    """Half-cosine schedule from ``start`` at step 0 to ``end`` at step ``total_steps``."""
+    """Half-cosine ``start → end`` over ``total_steps``."""
     if total_steps <= 0:
         return end
     t = min(max(step, 0), total_steps) / total_steps
@@ -516,9 +450,24 @@ def cosine_schedule(start: float, end: float, step: int, total_steps: int
 
 
 def linear_warmup(start: float, end: float, step: int, warmup_steps: int) -> float:
+    """Linear ``start → end`` over ``warmup_steps``; constant ``end`` after."""
     if warmup_steps <= 0 or step >= warmup_steps:
         return end
     return start + (end - start) * (step / warmup_steps)
+
+
+def linear_warmup_cosine_decay(start: float, peak: float, end: float,
+                               step: int, warmup_steps: int,
+                               total_steps: int) -> float:
+    """Linear warmup ``start → peak`` over ``warmup_steps``, then cosine decay
+    ``peak → end`` over the rest.
+
+    Mirrors ``dinov3/utils/schedulers.linear_warmup_cosine_decay``.
+    """
+    if step < warmup_steps:
+        return linear_warmup(start, peak, step, warmup_steps)
+    return cosine_schedule(peak, end, step - warmup_steps,
+                           max(1, total_steps - warmup_steps))
 
 
 if __name__ == '__main__':
