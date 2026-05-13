@@ -18,7 +18,7 @@ FORCE="${FORCE:-0}"
 
 ckpt_done() {
     local name="$1"
-    local p="$CKPT_ROOT/neuronet/${name}/model/best_model.pth"
+    local p="$CKPT_ROOT/dino/${name}/model/best_model.pth"
     [[ -f "$p" ]]
 }
 
@@ -44,8 +44,8 @@ train_one() {
     if [[ -n "${SMOKE_TEST_SHARDS:-}" && "$SMOKE_TEST_SHARDS" != "0" ]]; then
         smoke_args+=(--smoke_test_shards "$SMOKE_TEST_SHARDS")
     fi
-    CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dp_neuronet.train \
-        --config_yaml config/vital_db/dp_neuronet.yaml \
+    CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dino.train \
+        --config_yaml config/vital_db/dino.yaml \
         --ch_idx "$idx" \
         --ckpt_path "$CKPT_ROOT" \
         --ssl_data_dir "$SSL_DIR" \
@@ -96,4 +96,4 @@ else
     done
 fi
 
-log "02_phase1: complete — ckpts under $CKPT_ROOT/neuronet/<MODAL>/model/"
+log "02_phase1: complete — ckpts under $CKPT_ROOT/dino/<MODAL>/model/"

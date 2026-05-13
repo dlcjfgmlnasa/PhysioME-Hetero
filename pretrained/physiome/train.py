@@ -14,7 +14,7 @@ import numpy as np
 import torch.optim as opt
 from models.utils import model_size
 from dataset.utils import group_cross_validation
-from models.dp_neuronet.model import BiosignalEncoder
+from models.dino.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from pretrained.physiome.data_loader import TorchDataset
 from pretrained.physiome.probe_utils import run_probe, select_probe_subsets

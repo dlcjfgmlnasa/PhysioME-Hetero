@@ -24,7 +24,7 @@ from dataset.data_parser.build_case_index import (  # noqa: E402
 )
 from dataset.data_parser.sample_holdout import sample_holdout  # noqa: E402
 from dataset.data_parser.vital_db_ssl import ShardWriter  # noqa: E402
-from pretrained.dp_neuronet.hetero_data_loader import (  # noqa: E402
+from pretrained.dino.hetero_data_loader import (  # noqa: E402
     ShardSingleModalDataset,
     load_holdout_case_ids,
 )

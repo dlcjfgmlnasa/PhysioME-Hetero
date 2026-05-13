@@ -15,10 +15,10 @@ probe_downstream_dir: null
 probe_every: 1
 
 modality_name2path:
-  'ABP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/ABP/model/best_model.pth'
-  'ECG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/ECG/model/best_model.pth'
-  'PPG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/PPG/model/best_model.pth'
-  'CVP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/neuronet/CVP/model/best_model.pth'
+  'ABP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/dino/ABP/model/best_model.pth'
+  'ECG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/dino/ECG/model/best_model.pth'
+  'PPG': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/dino/PPG/model/best_model.pth'
+  'CVP': '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/dino/CVP/model/best_model.pth'
 
 sfreq: 100
 rfreq: 100

@@ -24,7 +24,7 @@ from typing import List, Tuple
 
 import torch
 
-from pretrained.dp_neuronet.augment import (
+from pretrained.dino.augment import (
     AugmentConfig, apply_augment, random_temporal_crop,
 )
 

@@ -2,7 +2,7 @@
 import torch
 
 from downstream.model import PhysioMEClassifier
-from models.dp_neuronet.model import BiosignalEncoder
+from models.dino.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from models.transformer import apply_lora
 

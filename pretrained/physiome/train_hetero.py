@@ -42,7 +42,7 @@ from models.transformer import apply_lora
 from torch.utils.data import DataLoader
 
 from downstream.tasks.hypotension import HypotensionDataset
-from models.dp_neuronet.model import BiosignalEncoder
+from models.dino.model import BiosignalEncoder
 from models.physiome.model import PhysioME
 from models.utils import model_size
 from pretrained.physiome.hetero_data_loader import (

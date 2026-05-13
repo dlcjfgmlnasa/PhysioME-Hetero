@@ -34,8 +34,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.dp_neuronet.dino_head import DINOHead
-from models.dp_neuronet.resnet1d import FrameBackBone
+from models.dino.dino_head import DINOHead
+from models.dino.resnet1d import FrameBackBone
 from models.transformer import (
     QueryKeyProjection, RMSNorm, RotaryProjection, TransformerEncoder,
 )

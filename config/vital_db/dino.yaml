@@ -83,4 +83,4 @@ dino_weight: 1.0
 print_point: 20
 # Save path: <ckpt_path>/<model_name>/<MODAL>/model/best_model.pth + last_model.pth.
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
-model_name: 'neuronet'   # legacy dir name; ckpt schema below is 'dinov3'.
+model_name: 'dino'   # legacy dir name; ckpt schema below is 'dinov3'.

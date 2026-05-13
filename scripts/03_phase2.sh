@@ -6,7 +6,7 @@ print_env
 
 # Sanity: every Phase-1 ckpt must be present before Phase-2 can wire backbones.
 for m in ABP ECG PPG CVP CO2 AWP; do
-    p="$CKPT_ROOT/neuronet/$m/model/best_model.pth"
+    p="$CKPT_ROOT/dino/$m/model/best_model.pth"
     if [[ ! -f "$p" ]]; then
         log "✘ missing Phase-1 ckpt: $p"
         log "  run scripts/02_phase1.sh first."

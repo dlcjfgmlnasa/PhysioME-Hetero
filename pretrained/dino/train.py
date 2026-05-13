@@ -37,18 +37,18 @@ from torch.utils.data import DataLoader
 
 from downstream.tasks.hypotension import HypotensionDataset
 from downstream.tasks.modality_forecast import ModalityForecastDataset
-from models.dp_neuronet.model import (
+from models.dino.model import (
     BiosignalDINO, cosine_schedule, linear_warmup,
 )
 from models.utils import model_size
-from pretrained.dp_neuronet.hetero_data_loader import (
+from pretrained.dino.hetero_data_loader import (
     ShardSequentialSampler,
     ShardSingleModalDataset,
     load_holdout_case_ids,
     split_shards,
 )
-from pretrained.dp_neuronet.multicrop import MultiCropConfig, make_crops
-from pretrained.dp_neuronet.augment import AugmentConfig
+from pretrained.dino.multicrop import MultiCropConfig, make_crops
+from pretrained.dino.augment import AugmentConfig
 from pretrained.probe_dev_data import (
     PHASE1_PROBE_TASK_FOR_MODAL,
     load_dev_probe_modality_split,
@@ -73,7 +73,7 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_yaml', type=str,
                         default=os.path.join('..', '..', 'config', 'vital_db',
-                                             'dp_neuronet.yaml'))
+                                             'dino.yaml'))
     parser.add_argument('--ch_idx', type=int, default=None,
                         help='override ch_idx from yaml (0=ABP, ... 5=AWP)')
     parser.add_argument('--ckpt_path', type=str, default=None)
@@ -157,7 +157,7 @@ class Trainer:
         self.clipping_norm_value = float(getattr(args, 'clip_grad', 3.0))
 
         # Shard split.
-        from pretrained.dp_neuronet.hetero_data_loader import _read_manifest
+        from pretrained.dino.hetero_data_loader import _read_manifest
         manifest = _read_manifest(args.ssl_data_dir)
         self.num_shards = len(manifest['shards'])
         smoke_n = int(getattr(args, 'smoke_test_shards', 0) or 0)
@@ -210,7 +210,7 @@ class Trainer:
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, 'train.log')
 
-        logger = logging.getLogger(f'dp_neuronet.{self.modal_name}.{id(self)}')
+        logger = logging.getLogger(f'dino.{self.modal_name}.{id(self)}')
         logger.setLevel(logging.INFO)
         logger.propagate = False
         for h in list(logger.handlers):
