@@ -53,6 +53,13 @@ encoder_embed_dim: 512
 encoder_heads: 8
 encoder_depths: 6
 
+# Register / storage tokens (Darcet et al. 2024, "Vision Transformers Need
+# Registers"). Architectural-only — never enter any SSL loss; the encoder
+# uses them as a scratchpad so it stops repurposing low-information patch
+# tokens (flatlines, baseline, expiration plateaus) as global-info hubs.
+# DINOv3 ViT-7B uses 4; default 0 here for backward compat.
+n_storage_tokens: 4
+
 # DINO head (CLS-level prototype assignment).
 dino_head_hidden_dim: 2048
 dino_head_bottleneck_dim: 256

@@ -121,6 +121,7 @@ class Trainer:
             encoder_embed_dim=args.encoder_embed_dim,
             encoder_heads=args.encoder_heads,
             encoder_depths=args.encoder_depths,
+            n_storage_tokens=int(getattr(args, 'n_storage_tokens', 0)),
             dino_head_hidden_dim=int(getattr(args, 'dino_head_hidden_dim', 2048)),
             dino_head_bottleneck_dim=int(getattr(args, 'dino_head_bottleneck_dim', 256)),
             dino_head_n_prototypes=int(getattr(args, 'dino_head_n_prototypes', 8192)),
@@ -585,6 +586,7 @@ class Trainer:
             encoder_embed_dim=self.args.encoder_embed_dim,
             encoder_heads=self.args.encoder_heads,
             encoder_depths=self.args.encoder_depths,
+            n_storage_tokens=int(getattr(self.args, 'n_storage_tokens', 0)),
         )
         torch.save({
             'model_state': state_dict,

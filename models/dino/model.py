@@ -86,14 +86,18 @@ def frame_size(fs: int, second: int, time_window: int, time_step: float
 class BiosignalEncoder(nn.Module):
     """Encoder used by both Phase-1 SSL and Phase-2 backbone reuse.
 
-    Output shape is ``[B, num_frames + 1, encoder_embed_dim]`` with the
-    leading position being the CLS token. ``frame_step`` and frame size are
-    derived from ``(fs, time_window, time_step)`` via :func:`frame_size`.
+    Output shape is ``[B, 1 + n_storage_tokens + num_frames, encoder_embed_dim]``
+    with the leading position being the CLS token, then ``n_storage_tokens``
+    register / storage tokens (Darcet et al. 2024, "Vision Transformers Need
+    Registers"; DINOv3 ssl_meta_arch.py reads them as ``x_storage_tokens``
+    and never feeds them into any loss), then the patch tokens. Frame step
+    and frame size are derived via :func:`frame_size`.
     """
 
     def __init__(self, fs: int, second: int, time_window: int, time_step: float,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
-                 freeze_cls_token: bool = False):
+                 freeze_cls_token: bool = False,
+                 n_storage_tokens: int = 0):
         super().__init__()
         self.fs, self.second = fs, second
         self.time_window, self.time_step = time_window, time_step
@@ -102,6 +106,7 @@ class BiosignalEncoder(nn.Module):
         self.encoder_embed_dim = encoder_embed_dim
         self.encoder_heads = encoder_heads
         self.encoder_depths = encoder_depths
+        self.n_storage_tokens = int(n_storage_tokens)
 
         self.num_patches, self.frame_size = frame_size(
             fs=fs, second=second, time_window=time_window, time_step=time_step,
@@ -120,18 +125,37 @@ class BiosignalEncoder(nn.Module):
         if freeze_cls_token:
             self.cls_token.requires_grad = False
 
+        # Register / storage tokens. None when n_storage_tokens == 0 so the
+        # ckpt state-dict stays empty-keyed for backward compat with the
+        # initial DINOv3 port that shipped without them.
+        if self.n_storage_tokens > 0:
+            self.storage_tokens = nn.Parameter(
+                torch.zeros(1, self.n_storage_tokens, encoder_embed_dim),
+            )
+            nn.init.trunc_normal_(self.storage_tokens, std=0.02)
+        else:
+            self.storage_tokens = None
+
     def make_frame(self, x: torch.Tensor) -> torch.Tensor:
         """Slice ``[B, T]`` into ``[B, F, W]`` frames via ``Tensor.unfold``."""
         return x.unfold(
             dimension=-1, size=self.window_samples, step=self.frame_step,
         ).contiguous()
 
+    def prepend_class_and_storage(self, x: torch.Tensor) -> torch.Tensor:
+        """Concat ``[CLS, storage_tokens, patches]`` along the sequence axis."""
+        b = x.shape[0]
+        parts = [self.cls_token.expand(b, -1, -1)]
+        if self.storage_tokens is not None:
+            parts.append(self.storage_tokens.expand(b, -1, -1))
+        parts.append(x)
+        return torch.cat(parts, dim=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.make_frame(x)
         x = self.frame_backbone(x)
         x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        x = self.prepend_class_and_storage(x)
         x = self.encoder(x)
         return x
 
@@ -198,6 +222,8 @@ class BiosignalDINO(nn.Module):
     def __init__(self,
                  fs: int, second: int, time_window: int, time_step: float,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
+                 # Register / storage tokens (Darcet et al. 2024).
+                 n_storage_tokens: int = 0,
                  # DINO head.
                  dino_head_hidden_dim: int = 2048,
                  dino_head_bottleneck_dim: int = 256,
@@ -228,6 +254,7 @@ class BiosignalDINO(nn.Module):
             encoder_heads=encoder_heads,
             encoder_depths=encoder_depths,
             freeze_cls_token=False,
+            n_storage_tokens=n_storage_tokens,
         )
         self.student_dino_head = DINOHead(
             in_dim=encoder_embed_dim,
@@ -311,6 +338,7 @@ class BiosignalDINO(nn.Module):
         x = enc.frame_backbone(x)
         x = enc.patch_embed(x)  # [n_g * B, F, D]
         n, f, d = x.shape
+        n_storage = enc.n_storage_tokens
 
         patch_mask = make_block_mask(
             n_crops=n, n_patches=f,
@@ -325,10 +353,11 @@ class BiosignalDINO(nn.Module):
         if patch_mask.any():
             x = torch.where(patch_mask.unsqueeze(-1), self.mask_token, x)
 
-        cls_tokens = enc.cls_token.expand(n, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        x = enc.prepend_class_and_storage(x)
         x = enc.encoder(x)
-        cls_feat, patch_feat = x[:, 0, :], x[:, 1:, :]
+        # Slot layout: [CLS, storage_0..storage_{n_storage-1}, patch_0..patch_{F-1}]
+        cls_feat = x[:, 0, :]
+        patch_feat = x[:, 1 + n_storage:, :]
         cls_logits = self.student_dino_head(cls_feat)
         if self.ibot_weight > 0:
             patch_logits = self.student_ibot_head(
@@ -350,12 +379,17 @@ class BiosignalDINO(nn.Module):
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Teacher forward on globals — CLS + per-patch logits.
 
+        Storage tokens are dropped at the slice; they are exposed for parity
+        with the reference (``x_storage_tokens``) but never enter any loss.
+
         Returns:
             cls_logits  : [n_g * B, K_dino]
             patch_logits: [n_g * B, F, K_ibot]
         """
         z = self.teacher_encoder(globals_)
-        cls_feat, patch_feat = z[:, 0, :], z[:, 1:, :]
+        n_storage = self.teacher_encoder.n_storage_tokens
+        cls_feat = z[:, 0, :]
+        patch_feat = z[:, 1 + n_storage:, :]
         cls_logits = self.teacher_dino_head(cls_feat)
         if self.ibot_weight > 0:
             n, f, d = patch_feat.shape
