@@ -153,6 +153,7 @@ class Trainer:
             artifact_flat_thresh=float(getattr(args, 'artifact_flat_thresh', 0.5)),
             artifact_amp_thresh=float(getattr(args, 'artifact_amp_thresh', 0.5)),
             artifact_zero_thresh=float(getattr(args, 'artifact_zero_thresh', 0.4)),
+            artifact_peak_thresh=float(getattr(args, 'artifact_peak_thresh', 8.0)),
         ).to(device)
 
         # Multi-crop config.

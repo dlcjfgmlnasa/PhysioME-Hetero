@@ -254,7 +254,8 @@ class BiosignalDINO(nn.Module):
                  use_artifact_mask: bool = True,
                  artifact_flat_thresh: float = 0.5,
                  artifact_amp_thresh: float = 0.5,
-                 artifact_zero_thresh: float = 0.4):
+                 artifact_zero_thresh: float = 0.4,
+                 artifact_peak_thresh: float = 8.0):
         super().__init__()
         self.student_encoder = BiosignalEncoder(
             fs=fs, second=second,
@@ -319,6 +320,7 @@ class BiosignalDINO(nn.Module):
         self.artifact_flat_thresh = float(artifact_flat_thresh)
         self.artifact_amp_thresh = float(artifact_amp_thresh)
         self.artifact_zero_thresh = float(artifact_zero_thresh)
+        self.artifact_peak_thresh = float(artifact_peak_thresh)
 
     # ─────────────────────────────────────────────────────────────
     # Artifact detection
@@ -332,7 +334,7 @@ class BiosignalDINO(nn.Module):
         Returns [B, F] bool, True where the patch is judged to be an
         artifact (flatline, saturation, or zero-filled NaN region).
 
-        Three checks (any one true → artifact):
+        Four checks (any one true → artifact):
           * flat_ratio: fraction of adjacent samples whose |diff| < 1e-2.
             High in flatline / saturation regions.
           * amp_range: max(patch) - min(patch). Tiny when the patch is
@@ -340,6 +342,11 @@ class BiosignalDINO(nn.Module):
           * zero_ratio: fraction of samples whose |value| < 0.01. Catches
             NaN-filled patches because vital_db_ssl writes zero where the
             original parser inserted NaN.
+          * peak_abs: ``max(|x|)``. Large when the patch contains an
+            extreme-amplitude spike (sensor saturation, electrocautery
+            burst that survived the parser's spike check, sudden
+            disconnect transient). z-scored input → 8 std is already a
+            statistical outlier; ECG saturations easily reach z = -20+.
         """
         enc = self.student_encoder
         # Compute actual num_patches from the input length so the same path
@@ -364,11 +371,13 @@ class BiosignalDINO(nn.Module):
         flat_ratio = (diffs < 1e-2).float().mean(dim=-1)
         amp_range = frames.amax(dim=-1) - frames.amin(dim=-1)
         zero_ratio = (frames.abs() < 0.01).float().mean(dim=-1)
+        peak_abs = frames.abs().amax(dim=-1)
 
         is_artifact = (
             (flat_ratio > self.artifact_flat_thresh)
             | (amp_range < self.artifact_amp_thresh)
             | (zero_ratio > self.artifact_zero_thresh)
+            | (peak_abs > self.artifact_peak_thresh)
         )
         return is_artifact
 

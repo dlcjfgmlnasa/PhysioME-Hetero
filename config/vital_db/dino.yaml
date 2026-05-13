@@ -121,9 +121,10 @@ sinkhorn_n_iters: 3
 # (saturation, sensor dropout, NaN-filled regions) as distinguishing
 # features. iBOT loss is also computed only at non-artifact positions.
 use_artifact_mask: true
-artifact_flat_thresh: 0.5    # |diff| < 1e-2 보다 부드러운 sample 비율 한도
+artifact_flat_thresh: 0.5    # |diff| < 1e-2 sample 비율 한도 (flatline)
 artifact_amp_thresh: 0.5     # z-scored range 한도 (작으면 압축/평탄)
 artifact_zero_thresh: 0.4    # |x| < 0.01 sample 비율 (NaN→0 흔적 검출)
+artifact_peak_thresh: 8.0    # max(|x|) 한도 (z 단위; 큰 값 = 극단적 spike)
 
 # CLS-attention heatmap viz. Saves a PNG every ``viz_every`` epochs to
 # <ckpt>/<MODAL>/logs/attn/epoch_NNN.png showing CLS-to-patch attention
