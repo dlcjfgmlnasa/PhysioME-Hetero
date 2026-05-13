@@ -104,6 +104,13 @@ dino_weight: 1.0
 # Sinkhorn-Knopp iterations for teacher centering (reference: 3).
 sinkhorn_n_iters: 3
 
+# CLS-attention heatmap viz. Saves a PNG every ``viz_every`` epochs to
+# <ckpt>/<MODAL>/logs/attn/epoch_NNN.png showing CLS-to-patch attention
+# weights from the last student encoder layer, overlaid on a fixed set
+# of val-loader waveforms. 0 disables.
+viz_every: 5
+viz_batch_size: 4
+
 print_point: 20
 # Save path: <ckpt_path>/<model_name>/<MODAL>/model/{best,last}_model.pth.
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'

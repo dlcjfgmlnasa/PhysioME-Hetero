@@ -380,6 +380,21 @@ class Trainer:
         print(f'   >> Train segments : {len(train_dataloader.dataset)}')
         print(f'   >> Val   segments : {len(val_dataloader.dataset)}\n')
 
+        # Fixed viz batch: first N val samples so attention plots are
+        # epoch-over-epoch comparable on the same waveforms.
+        self._viz_batch = None
+        viz_every = int(getattr(self.args, 'viz_every', 5) or 0)
+        viz_batch_size = int(getattr(self.args, 'viz_batch_size', 4) or 0)
+        if viz_every > 0 and viz_batch_size > 0:
+            for vx, _ in val_dataloader:
+                self._viz_batch = vx[:viz_batch_size].detach().clone()
+                break
+            if self._viz_batch is not None:
+                print(f'   >> Viz     : every {viz_every} epoch(s), '
+                      f'{self._viz_batch.shape[0]} sample(s) -> '
+                      '<ckpt>/<MODAL>/logs/attn/')
+        self._viz_every = viz_every
+
         amp_enabled = (device.type == 'cuda'
                        and not bool(getattr(self.args, 'no_amp', False)))
         if amp_enabled:
@@ -499,8 +514,97 @@ class Trainer:
                     total_step, epoch, self.probe_task_key, auroc, mf1,
                 )
 
+            # CLS-attention heatmap viz.
+            if self._viz_batch is not None and self._viz_every > 0 \
+                    and (epoch + 1) % self._viz_every == 0:
+                self._save_attention_viz(epoch, total_step)
+
         self._save(self.model.state_dict(), self.args.train_epochs - 1, total_step,
                    tag='last')
+
+    # ─────────────────────────────────────────────────────────────
+    # Attention-map viz
+    # ─────────────────────────────────────────────────────────────
+
+    def _save_attention_viz(self, epoch: int, total_step: int) -> None:
+        """Save a CLS-attention heatmap (4 fixed samples) under
+        ``<ckpt>/<MODAL>/logs/attn/epoch_NNN.png``.
+
+        Top: raw modal waveform. Overlaid red bands: CLS-to-patch attention
+        weights from the LAST encoder layer of the student. A tall band
+        over the 12-15 s region means the CLS token attends to whatever
+        morphology the model has learned at that time slot.
+        """
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            self.logger.info('viz step=%08d epoch=%03d skipped reason=%s',
+                             total_step, epoch, repr(e))
+            return
+
+        from models.dino.viz import last_layer_cls_attention
+
+        save_dir = os.path.join(self.args.ckpt_path, self.args.model_name,
+                                self.modal_name, 'logs', 'attn')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'epoch_{epoch:03d}.png')
+
+        self.model.eval()
+        x = self._viz_batch.to(device).float()
+        _, cls_attn = last_layer_cls_attention(self.model.student_encoder, x)
+        self.model.train()
+
+        n_storage = self.model.student_encoder.n_storage_tokens
+        # cls_attn: [B, 1 + n_storage + n_patches]
+        patch_attn = cls_attn[:, 1 + n_storage:].cpu().numpy()
+        # Storage-token attention (sanity check that they are absorbing some
+        # weight — non-trivial value = register-token mechanism is engaging).
+        store_attn = cls_attn[:, 1:1 + n_storage].cpu().numpy() \
+            if n_storage > 0 else None
+        signal = x.cpu().numpy()
+
+        fs = int(self.args.sfreq)
+        tw = float(self.args.time_window)
+        ts = float(self.args.time_step)
+        b = signal.shape[0]
+
+        fig, axes = plt.subplots(b, 1, figsize=(11, 2.2 * b), sharex=True)
+        if b == 1:
+            axes = [axes]
+        for i in range(b):
+            ax = axes[i]
+            t = np.arange(signal.shape[1]) / fs
+            ax.plot(t, signal[i], color='steelblue', linewidth=0.7, alpha=0.85)
+            ax.set_ylabel(f'sample {i}\n{self.modal_name}', fontsize=9)
+            ax.grid(alpha=0.2)
+            # Overlay CLS-to-patch attention as red shaded bands.
+            ax2 = ax.twinx()
+            max_w = max(float(patch_attn[i].max()), 1e-12)
+            for j in range(patch_attn.shape[1]):
+                t_start = j * ts
+                t_end = j * ts + tw
+                w = float(patch_attn[i, j]) / max_w
+                ax2.axvspan(t_start, t_end, ymin=0.0, ymax=w,
+                            color='crimson', alpha=0.30)
+            ax2.set_ylim(0, 1)
+            ax2.set_ylabel('CLS→patch', fontsize=8, color='crimson')
+            if store_attn is not None:
+                store_total = float(store_attn[i].sum())
+                ax.text(0.99, 0.95,
+                        f'CLS→storage={store_total:.3f}',
+                        transform=ax.transAxes, ha='right', va='top',
+                        fontsize=7, color='gray')
+        axes[-1].set_xlabel('time (s)')
+        fig.suptitle(f'epoch {epoch:03d}  step {total_step:08d}  '
+                     f'modal={self.modal_name}',
+                     fontsize=10)
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        self.logger.info('viz step=%08d epoch=%03d saved=%s',
+                         total_step, epoch, save_path)
 
     # ─────────────────────────────────────────────────────────────
     # Evaluation
