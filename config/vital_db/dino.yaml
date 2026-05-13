@@ -115,6 +115,16 @@ dino_weight: 1.0
 # Sinkhorn-Knopp iterations for teacher centering (reference: 3).
 sinkhorn_n_iters: 3
 
+# Patch-level artifact masking. Each 3-s patch is QC-screened on the raw
+# z-scored signal; failing patches are replaced by the iBOT mask_token
+# *before* the encoder so the SSL objective cannot latch onto artifacts
+# (saturation, sensor dropout, NaN-filled regions) as distinguishing
+# features. iBOT loss is also computed only at non-artifact positions.
+use_artifact_mask: true
+artifact_flat_thresh: 0.5    # |diff| < 1e-2 보다 부드러운 sample 비율 한도
+artifact_amp_thresh: 0.5     # z-scored range 한도 (작으면 압축/평탄)
+artifact_zero_thresh: 0.4    # |x| < 0.01 sample 비율 (NaN→0 흔적 검출)
+
 # CLS-attention heatmap viz. Saves a PNG every ``viz_every`` epochs to
 # <ckpt>/<MODAL>/logs/attn/epoch_NNN.png showing CLS-to-patch attention
 # weights from the last student encoder layer, overlaid on a fixed set

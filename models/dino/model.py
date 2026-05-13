@@ -245,7 +245,16 @@ class BiosignalDINO(nn.Module):
                  ibot_mask_sample_probability: float = 0.5,
                  ibot_min_block_size: int = 1,
                  # SK centering.
-                 sinkhorn_n_iters: int = 3):
+                 sinkhorn_n_iters: int = 3,
+                 # Patch-level artifact masking. When True, each patch's raw
+                 # frame is QC-screened (flatline ratio, amplitude range,
+                 # near-zero fraction); failing patches are replaced by the
+                 # iBOT mask_token *before* the encoder so the SSL objective
+                 # cannot use artifact regions as distinguishing features.
+                 use_artifact_mask: bool = True,
+                 artifact_flat_thresh: float = 0.5,
+                 artifact_amp_thresh: float = 0.5,
+                 artifact_zero_thresh: float = 0.4):
         super().__init__()
         self.student_encoder = BiosignalEncoder(
             fs=fs, second=second,
@@ -305,6 +314,63 @@ class BiosignalDINO(nn.Module):
         self.ibot_mask_sample_probability = float(ibot_mask_sample_probability)
         self.ibot_min_block_size = max(1, int(ibot_min_block_size))
         self.sinkhorn_n_iters = int(sinkhorn_n_iters)
+        # Patch-level artifact QC.
+        self.use_artifact_mask = bool(use_artifact_mask)
+        self.artifact_flat_thresh = float(artifact_flat_thresh)
+        self.artifact_amp_thresh = float(artifact_amp_thresh)
+        self.artifact_zero_thresh = float(artifact_zero_thresh)
+
+    # ─────────────────────────────────────────────────────────────
+    # Artifact detection
+    # ─────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _detect_patch_artifacts(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-patch QC on the raw signal frames.
+
+        x: [B, T] z-scored signal (loader normalises to mean 0 / std 1).
+        Returns [B, F] bool, True where the patch is judged to be an
+        artifact (flatline, saturation, or zero-filled NaN region).
+
+        Three checks (any one true → artifact):
+          * flat_ratio: fraction of adjacent samples whose |diff| < 1e-2.
+            High in flatline / saturation regions.
+          * amp_range: max(patch) - min(patch). Tiny when the patch is
+            compressed (sensor dropout, baseline drift to constant).
+          * zero_ratio: fraction of samples whose |value| < 0.01. Catches
+            NaN-filled patches because vital_db_ssl writes zero where the
+            original parser inserted NaN.
+        """
+        enc = self.student_encoder
+        # Compute actual num_patches from the input length so the same path
+        # works for both global (60s) and local (15s) crops without baking
+        # in self.student_encoder.num_patches (which is the global default).
+        n_patches = max(
+            0,
+            (x.shape[-1] - enc.window_samples) // enc.frame_step + 1,
+        )
+        if not self.use_artifact_mask:
+            return torch.zeros(
+                (x.shape[0], n_patches),
+                dtype=torch.bool, device=x.device,
+            )
+        frames = x.unfold(
+            dimension=-1,
+            size=enc.window_samples,
+            step=enc.frame_step,
+        ).contiguous()  # [B, F, W]
+
+        diffs = torch.abs(frames[..., 1:] - frames[..., :-1])
+        flat_ratio = (diffs < 1e-2).float().mean(dim=-1)
+        amp_range = frames.amax(dim=-1) - frames.amin(dim=-1)
+        zero_ratio = (frames.abs() < 0.01).float().mean(dim=-1)
+
+        is_artifact = (
+            (flat_ratio > self.artifact_flat_thresh)
+            | (amp_range < self.artifact_amp_thresh)
+            | (zero_ratio > self.artifact_zero_thresh)
+        )
+        return is_artifact
 
     # ─────────────────────────────────────────────────────────────
     # Encoder helpers (also used by probe code via forward_latent)
@@ -324,23 +390,32 @@ class BiosignalDINO(nn.Module):
     # Loss-side forward (used during training)
     # ─────────────────────────────────────────────────────────────
 
-    def _encode_globals_masked(self, globals_: torch.Tensor
-                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Student forward on global crops with BEiT-style block masking.
-
-        Returns:
-            cls_logits   : [n_g * B, K_dino]
-            patch_logits : [n_g * B, F, K_ibot]
-            patch_mask   : [n_g * B, F] bool — True at masked positions
+    def _run_encoder_with_mask(self, encoder, x_signal: torch.Tensor,
+                               replace_mask: torch.Tensor) -> torch.Tensor:
+        """Encoder forward with per-patch positions optionally replaced by
+        ``self.mask_token``. Returns the full encoder output sequence
+        ``[B, 1 + n_storage + F, D]``.
         """
-        enc = self.student_encoder
-        x = enc.make_frame(globals_)
-        x = enc.frame_backbone(x)
-        x = enc.patch_embed(x)  # [n_g * B, F, D]
-        n, f, d = x.shape
-        n_storage = enc.n_storage_tokens
+        x = encoder.make_frame(x_signal)
+        x = encoder.frame_backbone(x)
+        x = encoder.patch_embed(x)
+        if replace_mask is not None and replace_mask.any():
+            x = torch.where(replace_mask.unsqueeze(-1), self.mask_token, x)
+        x = encoder.prepend_class_and_storage(x)
+        x = encoder.encoder(x)
+        return x
 
-        patch_mask = make_block_mask(
+    def _encode_globals_masked(self, globals_: torch.Tensor,
+                               artifact_mask: torch.Tensor
+                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Student forward on global crops with combined artifact + iBOT
+        masking. Returns ``(cls_logits, patch_logits, ibot_loss_mask)`` where
+        ``ibot_loss_mask`` flags positions that should contribute to the iBOT
+        loss (iBOT-masked AND not artifact)."""
+        enc = self.student_encoder
+        n_storage = enc.n_storage_tokens
+        n, f = artifact_mask.shape
+        ibot_mask = make_block_mask(
             n_crops=n, n_patches=f,
             mask_ratio_min=self.ibot_mask_ratio_min,
             mask_ratio_max=self.ibot_mask_ratio_max,
@@ -348,45 +423,44 @@ class BiosignalDINO(nn.Module):
                 self.ibot_mask_sample_probability if self.ibot_weight > 0 else 0.0
             ),
             min_block_size=self.ibot_min_block_size,
-            device=x.device,
+            device=globals_.device,
         )
-        if patch_mask.any():
-            x = torch.where(patch_mask.unsqueeze(-1), self.mask_token, x)
+        combined_mask = ibot_mask | artifact_mask
+        z = self._run_encoder_with_mask(enc, globals_, combined_mask)
 
-        x = enc.prepend_class_and_storage(x)
-        x = enc.encoder(x)
-        # Slot layout: [CLS, storage_0..storage_{n_storage-1}, patch_0..patch_{F-1}]
-        cls_feat = x[:, 0, :]
-        patch_feat = x[:, 1 + n_storage:, :]
+        cls_feat = z[:, 0, :]
+        patch_feat = z[:, 1 + n_storage:, :]
         cls_logits = self.student_dino_head(cls_feat)
         if self.ibot_weight > 0:
+            _, _, d = patch_feat.shape
             patch_logits = self.student_ibot_head(
                 patch_feat.reshape(n * f, d)
             ).reshape(n, f, -1)
         else:
             patch_logits = patch_feat.new_zeros((n, f, self.ibot_n_prototypes))
-        return cls_logits, patch_logits, patch_mask
+        # iBOT loss should only count positions that were iBOT-masked AND
+        # are NOT artifacts (teacher features at artifacts are garbage).
+        ibot_loss_mask = ibot_mask & ~artifact_mask
+        return cls_logits, patch_logits, ibot_loss_mask
 
-    def _encode_locals(self, locals_: torch.Tensor) -> torch.Tensor:
-        """Student forward on local crops — CLS only. ``[n_l * B, K_dino]``."""
+    def _encode_locals(self, locals_: torch.Tensor,
+                       artifact_mask: torch.Tensor) -> torch.Tensor:
+        """Student forward on local crops — CLS only with artifact masking."""
         if locals_.shape[0] == 0:
             return locals_.new_zeros((0, self.dino_n_prototypes))
-        z = self.student_encoder(locals_)
+        z = self._run_encoder_with_mask(
+            self.student_encoder, locals_, artifact_mask,
+        )
         return self.student_dino_head(z[:, 0, :])
 
     @torch.no_grad()
-    def _encode_teacher(self, globals_: torch.Tensor
+    def _encode_teacher(self, globals_: torch.Tensor,
+                        artifact_mask: torch.Tensor
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Teacher forward on globals — CLS + per-patch logits.
-
-        Storage tokens are dropped at the slice; they are exposed for parity
-        with the reference (``x_storage_tokens``) but never enter any loss.
-
-        Returns:
-            cls_logits  : [n_g * B, K_dino]
-            patch_logits: [n_g * B, F, K_ibot]
-        """
-        z = self.teacher_encoder(globals_)
+        """Teacher forward on globals — CLS + per-patch logits, with the
+        same artifact-mask applied so teacher distributions at artifact
+        slots come from ``mask_token`` rather than poisoned content."""
+        z = self._run_encoder_with_mask(self.teacher_encoder, globals_, artifact_mask)
         n_storage = self.teacher_encoder.n_storage_tokens
         cls_feat = z[:, 0, :]
         patch_feat = z[:, 1 + n_storage:, :]
@@ -422,12 +496,23 @@ class BiosignalDINO(nn.Module):
         if globals_.shape[0] % n_global != 0:
             raise RuntimeError('globals_ batch axis is not divisible by n_global')
 
-        # Student forward (with iBOT block mask) + locals.
-        s_g_cls, s_g_patch, patch_mask = self._encode_globals_masked(globals_)
-        s_l_cls = self._encode_locals(locals_)
+        # Patch-level artifact detection (shared between student and teacher
+        # so both encoders see the same artifact slots replaced by mask_token).
+        artifact_mask_g = self._detect_patch_artifacts(globals_)
+        artifact_mask_l = (
+            self._detect_patch_artifacts(locals_)
+            if locals_.shape[0] > 0
+            else locals_.new_zeros((0, 0), dtype=torch.bool)
+        )
 
-        # Teacher forward (no_grad).
-        t_g_cls, t_g_patch = self._encode_teacher(globals_)
+        # Student forward (with iBOT block mask + artifact mask) + locals.
+        s_g_cls, s_g_patch, patch_mask = self._encode_globals_masked(
+            globals_, artifact_mask_g,
+        )
+        s_l_cls = self._encode_locals(locals_, artifact_mask_l)
+
+        # Teacher forward (no_grad, artifact mask only).
+        t_g_cls, t_g_patch = self._encode_teacher(globals_, artifact_mask_g)
 
         # Sinkhorn-Knopp normalisation on teacher CLS logits.
         t_cls_dist = self.dino_loss.sinkhorn_knopp_teacher(
@@ -460,8 +545,10 @@ class BiosignalDINO(nn.Module):
             loss_ibot = globals_.new_zeros(())
 
         loss = self.dino_weight * loss_dino + self.ibot_weight * loss_ibot
+        artifact_rate = artifact_mask_g.float().mean().detach()
         return loss, {'dino': loss_dino.detach(),
-                      'ibot': loss_ibot.detach()}
+                      'ibot': loss_ibot.detach(),
+                      'artifact_rate': artifact_rate}
 
     # ─────────────────────────────────────────────────────────────
     # EMA teacher update

@@ -149,6 +149,10 @@ class Trainer:
             ),
             ibot_min_block_size=int(getattr(args, 'ibot_min_block_size', 1)),
             sinkhorn_n_iters=int(getattr(args, 'sinkhorn_n_iters', 3)),
+            use_artifact_mask=bool(getattr(args, 'use_artifact_mask', True)),
+            artifact_flat_thresh=float(getattr(args, 'artifact_flat_thresh', 0.5)),
+            artifact_amp_thresh=float(getattr(args, 'artifact_amp_thresh', 0.5)),
+            artifact_zero_thresh=float(getattr(args, 'artifact_zero_thresh', 0.4)),
         ).to(device)
 
         # Multi-crop config.
@@ -473,11 +477,12 @@ class Trainer:
 
                 self.logger.info(
                     'train step=%08d epoch=%03d dino=%.6f ibot=%.6f total=%.6f '
-                    't_temp=%.4f ema=%.4f',
+                    't_temp=%.4f ema=%.4f artifact_rate=%.4f',
                     total_step, epoch,
                     float(logs['dino']), float(logs['ibot']), float(loss),
                     float(self.model.teacher_temp),
                     float(cosine_schedule(ema_start, ema_end, total_step, total_steps)),
+                    float(logs.get('artifact_rate', 0.0)),
                 )
 
                 step += 1
