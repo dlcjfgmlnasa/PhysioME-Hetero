@@ -61,15 +61,22 @@ encoder_depths: 6
 n_storage_tokens: 4
 
 # DINO head (CLS-level prototype assignment).
+# K=1024 is sized to our single-GPU batch=256 so SK has B/K=0.25 (the
+# reference DINOv3 keeps B/K ~0.5 via 32k effective DDP batch; B/K<0.1
+# makes SK ill-conditioned). With K=8192 we had B/K=0.03 which is why
+# the dino loss was barely moving in the first smoke run.
 dino_head_hidden_dim: 2048
 dino_head_bottleneck_dim: 256
-dino_head_n_prototypes: 8192
+dino_head_n_prototypes: 1024
 dino_head_n_layers: 3
 
 # iBOT head — SEPARATE instance (DINOv3 mandates ibot.separate_head=true).
+# K=4096 because iBOT's effective batch is ~10x larger than DINO's: each
+# batch contributes batch_size * n_masked_patches * n_global crops masked
+# patches (~256 * 5 * 2 ~ 2,560), so B/K ~0.6 — well-conditioned for SK.
 ibot_head_hidden_dim: 2048
 ibot_head_bottleneck_dim: 256
-ibot_head_n_prototypes: 8192
+ibot_head_n_prototypes: 4096
 ibot_head_n_layers: 3
 
 # Multi-crop. global_samples must be <= sfreq * second; local <= global.
