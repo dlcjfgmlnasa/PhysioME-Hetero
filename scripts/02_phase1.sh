@@ -43,7 +43,10 @@ train_one() {
     if [[ -n "${SMOKE_TEST_SHARDS:-}" && "$SMOKE_TEST_SHARDS" != "0" ]]; then
         smoke_args+=(--smoke_test_shards "$SMOKE_TEST_SHARDS")
     fi
-    CUDA_VISIBLE_DEVICES="$gpu" python -m pretrained.dino.train \
+    # Tee to both the run-step log file AND the terminal so progress is
+    # visible without an extra `tail -f`. `set -o pipefail` (from _env.sh)
+    # propagates python's exit code through the pipeline.
+    CUDA_VISIBLE_DEVICES="$gpu" python -u -m pretrained.dino.train \
         --config_yaml config/vital_db/dino.yaml \
         --ch_idx "$idx" \
         --ckpt_path "$CKPT_ROOT" \
@@ -57,8 +60,8 @@ train_one() {
         --probe_every 1 \
         "${eager_args[@]}" \
         "${smoke_args[@]}" \
-        > "$out" 2>&1
-    local rc=$?
+        2>&1 | tee "$out"
+    local rc=${PIPESTATUS[0]}
     if [[ $rc -eq 0 ]]; then
         log "✔ DONE  phase1[$name]"
     else
