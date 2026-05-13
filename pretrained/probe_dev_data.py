@@ -36,6 +36,8 @@ import json
 import os
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
+import tqdm
+
 from downstream.tasks.hypotension import (
     ForecastSample,
     _load_case_npz as _load_case_npz_iohlike,
@@ -63,7 +65,9 @@ def _read_dev_cases_iohlike(downstream_dir: str, dev_ids: Set[str],
     required = set(s.lower() for s in input_signals) | {'abp'}
     cases: List[dict] = []
     missing = 0
-    for cid in sorted(dev_ids):
+    ids_sorted = sorted(dev_ids)
+    for cid in tqdm.tqdm(ids_sorted, desc='probe dev_iohlike',
+                         total=len(ids_sorted), mininterval=1.0):
         p = os.path.join(downstream_dir, f'{cid}.npz')
         if not os.path.isfile(p):
             missing += 1
@@ -93,7 +97,9 @@ def _read_dev_cases_modality(downstream_dir: str, dev_ids: Set[str],
     """Direct npz read for the dev cohort, single-modality forecast tasks."""
     cases: List[dict] = []
     missing = 0
-    for cid in sorted(dev_ids):
+    ids_sorted = sorted(dev_ids)
+    for cid in tqdm.tqdm(ids_sorted, desc=f'probe dev_{task.signal_key}',
+                         total=len(ids_sorted), mininterval=1.0):
         p = os.path.join(downstream_dir, f'{cid}.npz')
         if not os.path.isfile(p):
             missing += 1
