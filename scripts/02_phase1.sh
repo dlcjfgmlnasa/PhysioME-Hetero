@@ -31,8 +31,7 @@ train_one() {
     local name="${CH_NAMES[$idx]}"
     local out="$LOG_DIR/02_phase1_${name}.log"
     if [[ "$FORCE" != "1" ]] && ckpt_done "$name"; then
-        log "↷ SKIP  phase1[$name] — best_model.pth already exists "
-            "(set FORCE=1 to retrain)"
+        log "↷ SKIP  phase1[$name] — best_model.pth already exists (set FORCE=1 to retrain)"
         return 0
     fi
     log "▶ START phase1[$name] (idx=$idx gpu=$gpu eager=$EAGER) → $out"
