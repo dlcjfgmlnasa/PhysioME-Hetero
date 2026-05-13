@@ -58,6 +58,14 @@ from pretrained.probe_dev_data import (
 
 warnings.filterwarnings(action='ignore')
 
+# Force line-buffered stdout so print() and the logger's StreamHandler
+# interleave in order when the trainer is launched via run_step (which
+# redirects stdout to a file, otherwise stdout would be fully buffered).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    pass
+
 random_seed = 777
 np.random.seed(random_seed)
 torch.manual_seed(random_seed)
@@ -252,11 +260,17 @@ class Trainer:
         logger.propagate = False
         for h in list(logger.handlers):
             logger.removeHandler(h)
-        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-        fh.setFormatter(logging.Formatter(
+        formatter = logging.Formatter(
             '%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S',
-        ))
+        )
+        fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        fh.setFormatter(formatter)
         logger.addHandler(fh)
+        # Also stream to stdout so train / val / probe lines show up alongside
+        # the banner prints in the run_step log file (and live via tail -f).
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(formatter)
+        logger.addHandler(sh)
         return logger
 
     def _build_probe(self):
