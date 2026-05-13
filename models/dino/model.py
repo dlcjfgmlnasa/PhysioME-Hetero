@@ -154,38 +154,61 @@ def _ema_copy(target: nn.Module, source: nn.Module, momentum: float) -> None:
 class BiosignalDINO(nn.Module):
     """DINOv3-style self-distillation for unimodal biosignal SSL.
 
-    Forward consumes a multi-crop bundle (globals + locals) and returns the
-    total SSL loss plus a dict of unweighted sub-losses for logging. The
-    teacher network and centering buffer are owned here.
+    Matches the official DINOv3 reference for the four points where v1/v2
+    and v3 diverge:
+
+      * **Separate iBOT head.** DINO (CLS) and iBOT (patch) heads are
+        distinct ``DINOHead`` instances with their own hyperparameters
+        (their own prototype count, hidden / bottleneck dims).
+      * **Sinkhorn-Knopp centering** on the teacher logits (3 iterations)
+        instead of running-mean centering. No center buffer is kept.
+      * **Plain last_layer.** The DINO head's prototype linear is a plain
+        ``nn.Linear(bottleneck, K, bias=False)``. The "freeze last layer
+        for N epochs" stability trick is implemented as a zero-LR window
+        in the trainer, NOT by wrapping the linear in weight_norm.
+      * **Block-wise iBOT masking** with per-crop mask ratio drawn in
+        ``[ibot_mask_ratio_min, ibot_mask_ratio_max]`` and applied only
+        to ``ibot_mask_sample_probability`` of the global crops (the rest
+        get empty masks). Loss is per-image-normalised (``1/n_masked_in_image``)
+        then averaged over all global crops (including the unmasked ones,
+        which contribute 0). Matches ``iBOTPatchLoss.forward_masked`` in
+        the reference repo.
 
     Loss = dino_weight * L_dino + ibot_weight * L_ibot
 
-      L_dino: each *student* view (global or local) predicts the sharpened-
-              and-centered distribution emitted by every *teacher* global
-              view, except the same-crop pairing. Mean over pairs.
-      L_ibot: random patch positions in each student global crop are
-              replaced by a learnable mask token. At those positions, the
-              student predicts the teacher's per-patch distribution at the
-              same positions on the unmasked input. Off when ``ibot_weight=0``.
-
-    Centering: a running mean of the raw teacher prototype logits is kept
-    on-device and subtracted before sharpening. Updated via
-    :meth:`update_center` after each forward.
+      L_dino: every student crop (global or local) predicts the sharpened
+              + SK-normalised distribution from every teacher global view,
+              except the same-view (i==j) pair among globals.
+      L_ibot: at masked patch positions in each global crop, the student
+              predicts the teacher's per-patch distribution at the same
+              positions on the unmasked input. iBOT is global-only.
     """
 
     def __init__(self,
                  fs: int, second: int, time_window: int, time_step: float,
                  encoder_embed_dim: int, encoder_heads: int, encoder_depths: int,
-                 head_hidden_dim: int = 2048,
-                 head_bottleneck_dim: int = 256,
-                 head_n_prototypes: int = 8192,
-                 head_n_layers: int = 3,
+                 # DINO head.
+                 dino_head_hidden_dim: int = 2048,
+                 dino_head_bottleneck_dim: int = 256,
+                 dino_head_n_prototypes: int = 8192,
+                 dino_head_n_layers: int = 3,
+                 # iBOT head (separate; can differ).
+                 ibot_head_hidden_dim: int = 2048,
+                 ibot_head_bottleneck_dim: int = 256,
+                 ibot_head_n_prototypes: int = 8192,
+                 ibot_head_n_layers: int = 3,
+                 # Temperatures + loss weights.
                  student_temp: float = 0.1,
                  teacher_temp: float = 0.04,
-                 center_momentum: float = 0.9,
+                 dino_weight: float = 1.0,
                  ibot_weight: float = 1.0,
-                 ibot_mask_ratio: float = 0.3,
-                 dino_weight: float = 1.0):
+                 # iBOT block masking.
+                 ibot_mask_ratio_min: float = 0.1,
+                 ibot_mask_ratio_max: float = 0.5,
+                 ibot_mask_sample_probability: float = 0.5,
+                 ibot_min_block_size: int = 1,
+                 # SK centering.
+                 sinkhorn_n_iters: int = 3):
         super().__init__()
         self.student_encoder = BiosignalEncoder(
             fs=fs, second=second,
@@ -195,36 +218,46 @@ class BiosignalDINO(nn.Module):
             encoder_depths=encoder_depths,
             freeze_cls_token=False,
         )
-        self.student_head = DINOHead(
+        self.student_dino_head = DINOHead(
             in_dim=encoder_embed_dim,
-            hidden_dim=head_hidden_dim,
-            bottleneck_dim=head_bottleneck_dim,
-            n_prototypes=head_n_prototypes,
-            n_layers=head_n_layers,
+            hidden_dim=dino_head_hidden_dim,
+            bottleneck_dim=dino_head_bottleneck_dim,
+            n_prototypes=dino_head_n_prototypes,
+            n_layers=dino_head_n_layers,
+        )
+        self.student_ibot_head = DINOHead(
+            in_dim=encoder_embed_dim,
+            hidden_dim=ibot_head_hidden_dim,
+            bottleneck_dim=ibot_head_bottleneck_dim,
+            n_prototypes=ibot_head_n_prototypes,
+            n_layers=ibot_head_n_layers,
         )
 
-        # Teacher: deep-copied at init, then EMA-updated from the student.
-        # Frozen w.r.t. autograd (the no_grad on update + here is belt-and-suspenders).
+        # Teacher network: deep-copied at init, then EMA-updated from the
+        # student. Frozen w.r.t. autograd.
         self.teacher_encoder = copy.deepcopy(self.student_encoder)
-        self.teacher_head = copy.deepcopy(self.student_head)
-        _set_requires_grad(self.teacher_encoder, False)
-        _set_requires_grad(self.teacher_head, False)
+        self.teacher_dino_head = copy.deepcopy(self.student_dino_head)
+        self.teacher_ibot_head = copy.deepcopy(self.student_ibot_head)
+        for m in (self.teacher_encoder, self.teacher_dino_head,
+                  self.teacher_ibot_head):
+            _set_requires_grad(m, False)
 
         # iBOT mask token applied at patch-embedded positions (post patch_embed).
         self.mask_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        self.register_buffer(
-            'center', torch.zeros(1, head_n_prototypes),
-        )
-
         self.student_temp = float(student_temp)
         self.teacher_temp = float(teacher_temp)
-        self.center_momentum = float(center_momentum)
-        self.ibot_weight = float(ibot_weight)
-        self.ibot_mask_ratio = float(ibot_mask_ratio)
         self.dino_weight = float(dino_weight)
-        self.n_prototypes = int(head_n_prototypes)
+        self.ibot_weight = float(ibot_weight)
+        self.dino_n_prototypes = int(dino_head_n_prototypes)
+        self.ibot_n_prototypes = int(ibot_head_n_prototypes)
+        # iBOT block masking.
+        self.ibot_mask_ratio_min = float(ibot_mask_ratio_min)
+        self.ibot_mask_ratio_max = float(ibot_mask_ratio_max)
+        self.ibot_mask_sample_probability = float(ibot_mask_sample_probability)
+        self.ibot_min_block_size = max(1, int(ibot_min_block_size))
+        self.sinkhorn_n_iters = int(sinkhorn_n_iters)
 
     # ─────────────────────────────────────────────────────────────
     # Encoder helpers (also used by probe code via forward_latent)
@@ -244,15 +277,54 @@ class BiosignalDINO(nn.Module):
     # Loss-side forward (used during training)
     # ─────────────────────────────────────────────────────────────
 
+    # ─── iBOT block-mask generator (BEiT-style) ─────────────────────────
+    def _build_ibot_block_mask(self, n_crops: int, n_patches: int,
+                               device: torch.device) -> torch.Tensor:
+        """Per-crop block-wise mask in ``[ibot_mask_ratio_min, _max]``.
+
+        Only ``ibot_mask_sample_probability`` of the ``n_crops`` global crops
+        get a non-empty mask; the rest get all-False. For each masked crop,
+        the target ratio is drawn uniformly from ``[min, max]`` and filled
+        by a single contiguous block of patches at a random offset (1-D
+        analogue of BEiT's 2-D block sampling; for short patch sequences a
+        single block is plenty — 8 patches at most for a 60s global crop
+        downsampled to 20 frames means even one block covers the full
+        ``[0.1, 0.5]`` range).
+        """
+        mask = torch.zeros((n_crops, n_patches), dtype=torch.bool, device=device)
+        if (self.ibot_weight <= 0
+                or self.ibot_mask_sample_probability <= 0
+                or n_patches <= 0):
+            return mask
+        n_masked = int(round(n_crops * self.ibot_mask_sample_probability))
+        if n_masked <= 0:
+            return mask
+        # Which crops get masked? Pick the first n_masked after a random shuffle.
+        perm = torch.randperm(n_crops, device=device)
+        masked_idx = perm[:n_masked]
+        # Spread mask ratios linearly across the masked crops, like
+        # ``MaskingGenerator`` in dinov3/data/collate.py L40-58.
+        ratios = torch.linspace(
+            self.ibot_mask_ratio_min, self.ibot_mask_ratio_max,
+            steps=n_masked + 1, device=device,
+        )[1:]
+        for k, idx in enumerate(masked_idx.tolist()):
+            n_mask_tokens = max(self.ibot_min_block_size,
+                                int(round(float(ratios[k]) * n_patches)))
+            n_mask_tokens = min(n_mask_tokens, n_patches)
+            start = int(torch.randint(0, n_patches - n_mask_tokens + 1,
+                                      (1,), device=device).item())
+            mask[idx, start:start + n_mask_tokens] = True
+        return mask
+
     def _encode_globals_masked(self, globals_: torch.Tensor
-                               ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Student forward on global crops with iBOT-style patch masking.
+                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Student forward on global crops with BEiT-style block masking.
 
         Returns:
-            cls_logits  : [n_g * B, K]       — CLS prototype logits
-            patch_logits: [n_g * B, F, K] — per-patch prototype logits
-                          (used only at masked positions for L_ibot)
-            patch_mask  : [n_g * B, F]   bool — True at masked positions
+            cls_logits   : [n_g * B, K_dino]
+            patch_logits : [n_g * B, F, K_ibot]
+            patch_mask   : [n_g * B, F] bool — True at masked positions
         """
         enc = self.student_encoder
         x = enc.make_frame(globals_)
@@ -260,30 +332,29 @@ class BiosignalDINO(nn.Module):
         x = enc.patch_embed(x)  # [n_g * B, F, D]
         n, f, d = x.shape
 
-        if self.ibot_weight > 0 and self.ibot_mask_ratio > 0:
-            mask_prob = torch.full((n, f), self.ibot_mask_ratio, device=x.device)
-            patch_mask = torch.bernoulli(mask_prob).bool()
+        patch_mask = self._build_ibot_block_mask(n, f, x.device)
+        if patch_mask.any():
             x = torch.where(patch_mask.unsqueeze(-1), self.mask_token, x)
-        else:
-            patch_mask = torch.zeros((n, f), dtype=torch.bool, device=x.device)
 
         cls_tokens = enc.cls_token.expand(n, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = enc.encoder(x)
         cls_feat, patch_feat = x[:, 0, :], x[:, 1:, :]
-        cls_logits = self.student_head(cls_feat)
+        cls_logits = self.student_dino_head(cls_feat)
         if self.ibot_weight > 0:
-            patch_logits = self.student_head(patch_feat.reshape(n * f, d)).reshape(n, f, -1)
+            patch_logits = self.student_ibot_head(
+                patch_feat.reshape(n * f, d)
+            ).reshape(n, f, -1)
         else:
-            patch_logits = patch_feat.new_zeros((n, f, self.n_prototypes))
+            patch_logits = patch_feat.new_zeros((n, f, self.ibot_n_prototypes))
         return cls_logits, patch_logits, patch_mask
 
     def _encode_locals(self, locals_: torch.Tensor) -> torch.Tensor:
-        """Student forward on local crops — CLS only. ``[n_l * B, K]``."""
+        """Student forward on local crops — CLS only. ``[n_l * B, K_dino]``."""
         if locals_.shape[0] == 0:
-            return locals_.new_zeros((0, self.n_prototypes))
+            return locals_.new_zeros((0, self.dino_n_prototypes))
         z = self.student_encoder(locals_)
-        return self.student_head(z[:, 0, :])
+        return self.student_dino_head(z[:, 0, :])
 
     @torch.no_grad()
     def _encode_teacher(self, globals_: torch.Tensor
@@ -291,20 +362,49 @@ class BiosignalDINO(nn.Module):
         """Teacher forward on globals — CLS + per-patch logits.
 
         Returns:
-            cls_logits  : [n_g * B, K]
-            patch_logits: [n_g * B, F, K]
+            cls_logits  : [n_g * B, K_dino]
+            patch_logits: [n_g * B, F, K_ibot]
         """
         z = self.teacher_encoder(globals_)
         cls_feat, patch_feat = z[:, 0, :], z[:, 1:, :]
-        cls_logits = self.teacher_head(cls_feat)
+        cls_logits = self.teacher_dino_head(cls_feat)
         if self.ibot_weight > 0:
             n, f, d = patch_feat.shape
-            patch_logits = self.teacher_head(patch_feat.reshape(n * f, d)).reshape(n, f, -1)
+            patch_logits = self.teacher_ibot_head(
+                patch_feat.reshape(n * f, d)
+            ).reshape(n, f, -1)
         else:
             patch_logits = patch_feat.new_zeros(
-                (patch_feat.shape[0], patch_feat.shape[1], self.n_prototypes)
+                (patch_feat.shape[0], patch_feat.shape[1], self.ibot_n_prototypes)
             )
         return cls_logits, patch_logits
+
+    @staticmethod
+    @torch.no_grad()
+    def _sinkhorn_knopp(logits: torch.Tensor, eps: float,
+                        n_iters: int) -> torch.Tensor:
+        """Sinkhorn-Knopp soft assignment over the prototype axis.
+
+        ``logits``: ``[N, K]`` teacher prototype logits.
+        Returns ``[N, K]`` non-negative matrix Q whose rows sum to 1 and
+        whose columns sum to N/K (i.e. the prototype-marginal target),
+        suitable for use as the teacher's distribution in cross-entropy.
+        Matches the single-GPU version of
+        ``dinov3/loss/dino_clstoken_loss.sinkhorn_knopp_teacher``.
+        """
+        Q = torch.exp(logits / eps).t()  # [K, N]
+        n_samples = Q.shape[1]
+        n_prototypes = Q.shape[0]
+        sum_Q = Q.sum()
+        Q /= sum_Q
+        for _ in range(n_iters):
+            sum_of_rows = Q.sum(dim=1, keepdim=True)
+            Q /= sum_of_rows
+            Q /= n_prototypes
+            Q /= Q.sum(dim=0, keepdim=True)
+            Q /= n_samples
+        Q *= n_samples
+        return Q.t()  # [N, K]
 
     def forward(self,
                 globals_: torch.Tensor,
@@ -318,7 +418,7 @@ class BiosignalDINO(nn.Module):
                       crop-major: first B rows are crop 0, next B are crop 1, ...).
             locals_ : ``[n_local  * B, T_l]`` with same crop-major layout.
         Returns:
-            loss : scalar total loss = dino_weight * L_dino + ibot_weight * L_ibot
+            loss : scalar = dino_weight * L_dino + ibot_weight * L_ibot
             logs : dict of unweighted ``dino``, ``ibot`` losses for logging.
         """
         if n_global < 1:
@@ -327,23 +427,24 @@ class BiosignalDINO(nn.Module):
         if batch_size_g * n_global != globals_.shape[0]:
             raise RuntimeError('globals_ batch axis is not divisible by n_global')
 
-        # Student
+        # Student forward (with iBOT block mask) + locals.
         s_g_cls, s_g_patch, patch_mask = self._encode_globals_masked(globals_)
         s_l_cls = self._encode_locals(locals_)
 
-        # Teacher (no_grad)
+        # Teacher forward (no_grad).
         t_g_cls, t_g_patch = self._encode_teacher(globals_)
 
-        # Centering + sharpening for the teacher CLS distribution.
-        t_cls_sharp = (t_g_cls - self.center) / self.teacher_temp
-        t_cls_dist = F.softmax(t_cls_sharp, dim=-1)  # [n_g*B, K]
+        # Sinkhorn-Knopp normalisation on teacher CLS logits.
+        t_cls_dist = self._sinkhorn_knopp(
+            t_g_cls.float(), eps=self.teacher_temp, n_iters=self.sinkhorn_n_iters,
+        ).to(t_g_cls.dtype)
 
-        # Student log-softmax (full prototype distribution over K).
+        # Student log-softmax.
         s_g_logp = F.log_softmax(s_g_cls / self.student_temp, dim=-1)
         s_l_logp = (F.log_softmax(s_l_cls / self.student_temp, dim=-1)
                     if s_l_cls.shape[0] > 0 else None)
 
-        # Reshape to per-crop tensors.
+        # Reshape per-crop.
         t_cls_dist_v = t_cls_dist.view(n_global, batch_size_g, -1)
         s_g_logp_v = s_g_logp.view(n_global, batch_size_g, -1)
         if s_l_logp is not None:
@@ -352,66 +453,57 @@ class BiosignalDINO(nn.Module):
         else:
             s_l_logp_v = None
 
-        # ─── DINO loss: pair every teacher global with every student crop ─────
+        # ─── DINO loss: every teacher global pairs with every student crop ─────
         terms: List[torch.Tensor] = []
         for i in range(n_global):
             t_i = t_cls_dist_v[i]
-            # Student globals (skip same-crop pair).
+            # Student globals (skip i==j same-view pair).
             for j in range(n_global):
                 if j == i:
                     continue
                 terms.append(-(t_i * s_g_logp_v[j]).sum(dim=-1).mean())
-            # Student locals.
             if s_l_logp_v is not None and n_local > 0:
                 for j in range(n_local):
                     terms.append(-(t_i * s_l_logp_v[j]).sum(dim=-1).mean())
-        if terms:
-            loss_dino = torch.stack(terms).mean()
-        else:
-            loss_dino = globals_.new_zeros(())
+        loss_dino = (torch.stack(terms).mean()
+                     if terms else globals_.new_zeros(()))
 
-        # ─── iBOT loss: masked-patch prediction on student globals ────────────
+        # ─── iBOT loss: per-image-normalised, averaged over all globals ────────
         if self.ibot_weight > 0 and patch_mask.any():
-            t_patch_sharp = (t_g_patch - self.center) / self.teacher_temp
-            t_patch_dist = F.softmax(t_patch_sharp, dim=-1)
+            ng, fp = patch_mask.shape  # [n_g*B, F]
+            t_patch_flat = t_g_patch.reshape(ng * fp, -1).float()
+            t_patch_dist = self._sinkhorn_knopp(
+                t_patch_flat, eps=self.teacher_temp,
+                n_iters=self.sinkhorn_n_iters,
+            ).to(t_g_patch.dtype).reshape(ng, fp, -1)
             s_patch_logp = F.log_softmax(s_g_patch / self.student_temp, dim=-1)
-            # Per-position CE only at masked positions.
+
+            # Per-patch CE, then per-image inverse-mask-count weighting,
+            # then average over ALL global crops (unmasked ones contribute 0).
             ce = -(t_patch_dist * s_patch_logp).sum(dim=-1)  # [n_g*B, F]
             mask_f = patch_mask.float()
-            denom = mask_f.sum().clamp_min(1.0)
-            loss_ibot = (ce * mask_f).sum() / denom
+            n_masked_per_image = mask_f.sum(dim=-1).clamp_min(1.0)  # [n_g*B]
+            per_image = (ce * mask_f).sum(dim=-1) / n_masked_per_image
+            # Zero out rows that had no mask so they contribute 0 but still
+            # count in the denominator.
+            per_image = per_image * (mask_f.sum(dim=-1) > 0).float()
+            loss_ibot = per_image.sum() / ng
         else:
             loss_ibot = globals_.new_zeros(())
 
         loss = self.dino_weight * loss_dino + self.ibot_weight * loss_ibot
-
-        # Centering update (raw, un-sharpened teacher logits).
-        self._update_center(t_g_cls.detach(), t_g_patch.detach() if self.ibot_weight > 0 else None)
-
         return loss, {'dino': loss_dino.detach(),
                       'ibot': loss_ibot.detach()}
 
     # ─────────────────────────────────────────────────────────────
-    # EMA + centering utilities
+    # EMA teacher update
     # ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def update_teacher(self, momentum: float) -> None:
         _ema_copy(self.teacher_encoder, self.student_encoder, momentum)
-        _ema_copy(self.teacher_head, self.student_head, momentum)
-
-    @torch.no_grad()
-    def _update_center(self, t_cls: torch.Tensor,
-                       t_patch: Optional[torch.Tensor]) -> None:
-        # Combine CLS + patch (if iBOT on) into a single running mean.
-        batch_center = t_cls.mean(dim=0, keepdim=True)
-        if t_patch is not None:
-            n, f, k = t_patch.shape
-            patch_center = t_patch.reshape(n * f, k).mean(dim=0, keepdim=True)
-            batch_center = 0.5 * (batch_center + patch_center)
-        self.center.mul_(self.center_momentum).add_(
-            batch_center, alpha=1.0 - self.center_momentum,
-        )
+        _ema_copy(self.teacher_dino_head, self.student_dino_head, momentum)
+        _ema_copy(self.teacher_ibot_head, self.student_ibot_head, momentum)
 
 
 def cosine_schedule(start: float, end: float, step: int, total_steps: int
@@ -433,9 +525,10 @@ if __name__ == '__main__':
     m = BiosignalDINO(
         fs=100, second=60, time_window=3, time_step=3,
         encoder_embed_dim=256, encoder_heads=8, encoder_depths=4,
-        head_n_prototypes=2048,
+        dino_head_n_prototypes=2048,
+        ibot_head_n_prototypes=2048,
     )
-    g = torch.randn(8, 6000)  # 2 globals x 4 batch
+    g = torch.randn(8, 6000)   # 2 globals x 4 batch
     l = torch.randn(16, 1500)  # 4 locals x 4 batch
     loss, logs = m(g, l, n_global=2, n_local=4)
     print(f'loss={loss.item():.4f} dino={logs["dino"].item():.4f} '

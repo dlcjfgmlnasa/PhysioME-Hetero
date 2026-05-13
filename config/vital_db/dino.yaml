@@ -1,6 +1,5 @@
 # Phase-1 unimodal SSL via DINOv3-style self-distillation
-# (replaces the prior NeuroNet TF-C recipe). Train one modality at a time
-# via --ch_idx (0=ABP, 1=ECG, 2=PPG, 3=CVP, 4=CO2, 5=AWP).
+# (BiosignalDINO). Train one modality at a time via --ch_idx.
 
 ssl_data_dir: '/home/coder/workspace/updown/physiome_hetero_v2/train'
 
@@ -45,8 +44,8 @@ train_batch_accumulation: 1
 weight_decay: 0.04
 clip_grad: 3.0
 
-# Backbone architecture (kept identical to the prior NeuroNet encoder so
-# Phase-2 can transfer the encoder state-dict without changes).
+# Backbone (kept identical to the prior NeuroNet encoder so Phase-2 can
+# transfer the encoder state-dict without changes).
 second: 60
 time_window: 3
 time_step: 3
@@ -54,33 +53,51 @@ encoder_embed_dim: 512
 encoder_heads: 8
 encoder_depths: 6
 
-# DINO head.
-head_hidden_dim: 2048
-head_bottleneck_dim: 256
-head_n_prototypes: 8192
-head_n_layers: 3
+# DINO head (CLS-level prototype assignment).
+dino_head_hidden_dim: 2048
+dino_head_bottleneck_dim: 256
+dino_head_n_prototypes: 8192
+dino_head_n_layers: 3
 
-# Multi-crop. local_samples must be <= global_samples <= sfreq * second.
+# iBOT head — SEPARATE instance (DINOv3 mandates ibot.separate_head=true).
+ibot_head_hidden_dim: 2048
+ibot_head_bottleneck_dim: 256
+ibot_head_n_prototypes: 8192
+ibot_head_n_layers: 3
+
+# Multi-crop. global_samples must be <= sfreq * second; local <= global.
 n_global: 2
-n_local: 6
+n_local: 8
 global_samples: 6000     # 60 s @ 100 Hz
 local_samples: 1500      # 15 s @ 100 Hz
 
-# Self-distillation.
+# Self-distillation temps + schedules.
 student_temp: 0.1
 teacher_temp_start: 0.04
 teacher_temp_end: 0.07
-teacher_temp_warmup_epochs: 5
-ema_momentum_start: 0.994
+teacher_temp_warmup_epochs: 30
+ema_momentum_start: 0.992
 ema_momentum_end: 1.0
-center_momentum: 0.9
 
-# iBOT (patch-level prediction). Set ibot_weight=0 to disable.
+# DINOv3-style stability: zero the prototype-layer LR for this many epochs
+# at the start of training. Replaces the v1/v2 weight_norm magnitude freeze.
+freeze_last_layer_epochs: 1
+
+# iBOT block masking (BEiT-style). mask_ratio is drawn per-crop from
+# [min, max]; mask_sample_probability sets the FRACTION of crops that get
+# a non-empty mask. The rest get all-False and contribute 0 to the iBOT
+# loss but still count in the denominator (matches the reference).
 ibot_weight: 1.0
-ibot_mask_ratio: 0.3
+ibot_mask_ratio_min: 0.1
+ibot_mask_ratio_max: 0.5
+ibot_mask_sample_probability: 0.5
+ibot_min_block_size: 1
 dino_weight: 1.0
 
+# Sinkhorn-Knopp iterations for teacher centering (reference: 3).
+sinkhorn_n_iters: 3
+
 print_point: 20
-# Save path: <ckpt_path>/<model_name>/<MODAL>/model/best_model.pth + last_model.pth.
+# Save path: <ckpt_path>/<model_name>/<MODAL>/model/{best,last}_model.pth.
 ckpt_path: '/home/coder/workspace/updown/physiome_hetero_v2/ckpt/'
-model_name: 'dino'   # legacy dir name; ckpt schema below is 'dinov3'.
+model_name: 'dino'

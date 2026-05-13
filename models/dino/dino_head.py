@@ -1,11 +1,17 @@
 # -*- coding:utf-8 -*-
 """DINOv3 projection + prototype head for biosignal SSL.
 
-Follows the DINOv2/v3 head design: 3-layer MLP projector → L2-normalize →
-weight-normalized linear prototype layer (the "last_layer"). The prototype
-linear's weight magnitude is frozen so that only its direction is learned,
-which is what stabilises self-distillation. Centering + sharpening of the
-teacher logits live in BiosignalDINO; this module is just the head itself.
+Follows the official DINOv3 reference (``facebookresearch/dinov3``):
+3-layer MLP projector → L2-normalize → plain Linear prototype layer
+(``last_layer``). The "freeze last layer for N epochs" stability trick is
+NOT implemented by wrapping the prototype Linear in weight_norm anymore
+(the v1/v2 approach); DINOv3 instead zeros the LR of ``last_layer`` for
+the first ``freeze_last_layer_epochs`` via the LR scheduler. We expose
+``last_layer`` as its own submodule so the trainer can target it directly.
+
+DINO and iBOT heads are SEPARATE instances in DINOv3 (the codebase hard-
+asserts ``ibot.separate_head is True``), so this class is instantiated
+twice in BiosignalDINO — once for CLS / DINO, once for masked-patch / iBOT.
 """
 from __future__ import annotations
 
@@ -31,14 +37,8 @@ class DINOHead(nn.Module):
                 layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
             layers += [nn.Linear(hidden_dim, bottleneck_dim)]
             self.mlp = nn.Sequential(*layers)
+        self.last_layer = nn.Linear(bottleneck_dim, n_prototypes, bias=False)
         self.apply(self._init_weights)
-
-        last = nn.Linear(bottleneck_dim, n_prototypes, bias=False)
-        nn.init.trunc_normal_(last.weight, std=0.02)
-        self.last_layer = nn.utils.parametrizations.weight_norm(last)
-        # Freeze magnitude (only direction learns) — DINO stability trick.
-        self.last_layer.parametrizations.weight.original0.data.fill_(1.0)
-        self.last_layer.parametrizations.weight.original0.requires_grad = False
 
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
@@ -49,5 +49,6 @@ class DINOHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
+        eps = 1e-6 if x.dtype == torch.float16 else 1e-12
+        x = F.normalize(x, dim=-1, p=2, eps=eps)
         return self.last_layer(x)

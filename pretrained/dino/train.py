@@ -121,16 +121,25 @@ class Trainer:
             encoder_embed_dim=args.encoder_embed_dim,
             encoder_heads=args.encoder_heads,
             encoder_depths=args.encoder_depths,
-            head_hidden_dim=int(getattr(args, 'head_hidden_dim', 2048)),
-            head_bottleneck_dim=int(getattr(args, 'head_bottleneck_dim', 256)),
-            head_n_prototypes=int(getattr(args, 'head_n_prototypes', 8192)),
-            head_n_layers=int(getattr(args, 'head_n_layers', 3)),
+            dino_head_hidden_dim=int(getattr(args, 'dino_head_hidden_dim', 2048)),
+            dino_head_bottleneck_dim=int(getattr(args, 'dino_head_bottleneck_dim', 256)),
+            dino_head_n_prototypes=int(getattr(args, 'dino_head_n_prototypes', 8192)),
+            dino_head_n_layers=int(getattr(args, 'dino_head_n_layers', 3)),
+            ibot_head_hidden_dim=int(getattr(args, 'ibot_head_hidden_dim', 2048)),
+            ibot_head_bottleneck_dim=int(getattr(args, 'ibot_head_bottleneck_dim', 256)),
+            ibot_head_n_prototypes=int(getattr(args, 'ibot_head_n_prototypes', 8192)),
+            ibot_head_n_layers=int(getattr(args, 'ibot_head_n_layers', 3)),
             student_temp=float(getattr(args, 'student_temp', 0.1)),
             teacher_temp=float(getattr(args, 'teacher_temp_end', 0.07)),
-            center_momentum=float(getattr(args, 'center_momentum', 0.9)),
-            ibot_weight=float(getattr(args, 'ibot_weight', 1.0)),
-            ibot_mask_ratio=float(getattr(args, 'ibot_mask_ratio', 0.3)),
             dino_weight=float(getattr(args, 'dino_weight', 1.0)),
+            ibot_weight=float(getattr(args, 'ibot_weight', 1.0)),
+            ibot_mask_ratio_min=float(getattr(args, 'ibot_mask_ratio_min', 0.1)),
+            ibot_mask_ratio_max=float(getattr(args, 'ibot_mask_ratio_max', 0.5)),
+            ibot_mask_sample_probability=float(
+                getattr(args, 'ibot_mask_sample_probability', 0.5),
+            ),
+            ibot_min_block_size=int(getattr(args, 'ibot_min_block_size', 1)),
+            sinkhorn_n_iters=int(getattr(args, 'sinkhorn_n_iters', 3)),
         ).to(device)
 
         # Multi-crop config.
@@ -144,17 +153,41 @@ class Trainer:
             local_samples=int(getattr(args, 'local_samples', args.sfreq * 15)),
         )
 
-        # Optimisation. We exclude the teacher (no grad) automatically because
-        # its params have requires_grad=False; AdamW still adds them, so filter.
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        # Optimisation. We exclude the teacher (no grad) because its params
+        # have requires_grad=False, and we put the DINO/iBOT-head ``last_layer``
+        # in a separate AdamW param group so we can zero its LR for the first
+        # ``freeze_last_layer_epochs`` (DINOv3 stability trick — replaces the
+        # weight_norm-magnitude freeze from v1/v2).
+        last_layer_names = {
+            'student_dino_head.last_layer.weight',
+            'student_ibot_head.last_layer.weight',
+        }
+        head_params, last_layer_params = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name in last_layer_names:
+                last_layer_params.append(p)
+            else:
+                head_params.append(p)
         self.eff_batch_size = args.train_batch_size * args.train_batch_accumulation
         self.lr = args.train_base_learning_rate * self.eff_batch_size / 256
-        self.optimizer = opt.AdamW(params, lr=self.lr,
-                                   weight_decay=float(getattr(args, 'weight_decay', 0.04)))
+        self.optimizer = opt.AdamW(
+            [
+                {'params': head_params, 'lr': self.lr},
+                {'params': last_layer_params, 'lr': self.lr,
+                 'is_last_layer': True},
+            ],
+            lr=self.lr,
+            weight_decay=float(getattr(args, 'weight_decay', 0.04)),
+        )
         self.scheduler = opt.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=args.train_epochs,
         )
         self.clipping_norm_value = float(getattr(args, 'clip_grad', 3.0))
+        self.freeze_last_layer_epochs = int(
+            getattr(args, 'freeze_last_layer_epochs', 1),
+        )
 
         # Shard split.
         from pretrained.dino.hetero_data_loader import _read_manifest
@@ -353,6 +386,15 @@ class Trainer:
             sampler = getattr(train_dataloader, 'sampler', None)
             if sampler is not None and hasattr(sampler, 'set_epoch'):
                 sampler.set_epoch(epoch)
+
+            # DINOv3 stability trick: freeze prototype-layer LR for the first
+            # ``freeze_last_layer_epochs`` epochs (default 1). Implemented as
+            # a zero-LR window on the dedicated optimizer param group, NOT a
+            # weight_norm magnitude freeze.
+            for pg in self.optimizer.param_groups:
+                if pg.get('is_last_layer'):
+                    pg['lr'] = 0.0 if epoch < self.freeze_last_layer_epochs \
+                        else self.optimizer.param_groups[0]['lr']
 
             self.model.train()
             self.optimizer.zero_grad()
